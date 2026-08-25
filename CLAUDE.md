@@ -1,0 +1,39 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Observability for context engineering: capture the context an LLM app assembles (sessions → segments → sections), compile it into temporal/procedural traces, inspect it in a web UI. Spec and design brief live in `.omc/autopilot/` (`spec.md` is the authoritative contract; `design-brief.md` governs all web UI work).
+
+## Commands
+
+```sh
+npm install                 # workspace install (root)
+npm run build               # ordered: types -> sdk -> server -> web
+npm run test                # vitest across all workspaces
+npm run typecheck
+npm run dev:server          # tsx watch, :4720
+npm run dev:web             # vite, :5173, /api proxied to :4720
+npm run seed                # demo sessions into the local DB
+npm run test -w context-trace-server              # one workspace's tests
+npx vitest run src/trace/compile.test.ts -w ...   # single file: run vitest from that workspace dir
+docker compose up -d --build && docker compose run --rm seed   # full stack on :8080
+```
+
+`@context-trace/types` must be built before anything that imports it typechecks — run the root `build` (it orders workspaces explicitly; plain `--workspaces` scripts don't guarantee order).
+
+## Architecture (the parts that span files)
+
+- **Snapshot model is the core invariant.** Each *segment* is a full snapshot of assembled context (ordered *sections*), never an incremental patch. All diffing (added/changed/carried/removed, by section `key` + fnv1a-64 `contentHash`) happens server-side by comparing consecutive segment indexes. If you change capture semantics, you change the compiler and the UI too.
+- **`packages/types` is the contract** between SDK, server, and web — wire types, compiled-trace types, and the shared utils (`fnv1a64`, `estimateTokens`, `generateId`). Dependency-free and runtime-agnostic (no node:* imports); keep it that way.
+- **`packages/sdk`** — zero-runtime-dep client, built for async framework hooks: every capture call is a synchronous enqueue; only the background flusher does I/O; it must never throw into or block the host app. Segment builders survive interleaved async callbacks; `ct.session(id)` re-binds without re-emitting `session.started`.
+- **`server/`** — Hono + better-sqlite3. `src/trace/compile.ts` is pure (no DB/HTTP) and is where all trace semantics live; `src/app.ts` exports `createApp(db)` so tests run via `app.request()` with `:memory:` DBs. Ingest is idempotent (segment upsert replaces its sections) and partial-accept (bad events rejected per-index, good ones ingested).
+- **`web/`** — Vite/React SPA, hand-rolled SVG charts (no chart libs). Calls `/api/v1/*`; the `/api` prefix is stripped by the Vite dev proxy locally and by nginx in Docker (`web/nginx.conf`). Timeline and strata grid share one x-axis column grid — keep them aligned. Service colors are assigned by first-appearance order (`src/lib/colors.ts`), stable across all views in a session.
+- **Docker** builds run from the repo root context (`docker build -f server/Dockerfile .`) because workspaces need the root lockfile. The compose `seed` service runs `server/dist/seed.js` against the shared `/data` volume.
+
+## Conventions
+
+- TS strict + `noUncheckedIndexedAccess` + `verbatimModuleSyntax` (use `import type`); everything ESM with NodeNext resolution — except `web/`, which uses bundler resolution and does not extend the root tsconfig.
+- Server env: `CT_PORT` (4720), `CT_DB`, `CT_API_KEY` (auth off when unset), `CT_CORS_ORIGIN`.
+- UI text follows the design brief's voice: sentence case, labels name what the user sees, errors state the fix.

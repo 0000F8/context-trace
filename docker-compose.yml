@@ -1,0 +1,40 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "4720:4720"
+    volumes:
+      - ctdata:/data
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot demo data: docker compose run --rm seed
+  seed:
+    profiles: ["seed"]
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    entrypoint: ["node", "server/dist/seed.js"]
+    environment:
+      CT_DB: /data/context-trace.db
+    volumes:
+      - ctdata:/data
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  ctdata:
