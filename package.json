@@ -1,0 +1,16 @@
+{
+  "name": "context-trace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "workspaces": ["packages/types", "packages/sdk", "server", "web"],
+  "scripts": {
+    "build": "npm run build -w @context-trace/types && npm run build -w @context-trace/sdk && npm run build -w context-trace-server && npm run build -w context-trace-web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "seed": "npm run seed -w context-trace-server",
+    "dev:server": "npm run dev -w context-trace-server",
+    "dev:web": "npm run dev -w context-trace-web"
+  }
+}
