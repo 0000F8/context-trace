@@ -79,12 +79,42 @@ Only `flush()` and `shutdown()` return promises. Everything else (`startSession`
 - **Backpressure**: the queue is bounded by `maxQueue`. On overflow the oldest queued event is dropped (not the newest) and `onError` fires, so recent activity is preserved over stale activity.
 - **Option validation**: `maxBatch` and `maxQueue` are floored to whole numbers and must be `>= 1`; `flushIntervalMs` must be `>= 0`. A `NaN`, non-finite, or out-of-range value (including `maxBatch: 0`, which would otherwise make `flush()` loop forever splicing zero-length batches) is ignored and the default is used instead.
 - **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`.
+- **Browser lifecycle flush**: in browsers, hiding or unloading the page triggers an immediate keepalive flush of everything queued (see "Using from a browser"). In Node this path is inert.
 - **`enabled: false`**: turns the client into a complete no-op — useful for disabling tracing in tests or specific environments without changing call sites.
 
 ## Runtime
 
 Node 18+ (needs global `fetch`) or any modern browser. No `node:*` imports in
 any runtime code path — the package is safe to bundle for the browser.
+
+## Using from a browser
+
+The SDK works unmodified in browser apps (ESM import via your bundler; a few
+KB, zero dependencies). Two things differ from Node:
+
+**Endpoint.** Two patterns:
+
+- *Same-origin proxy (recommended):* serve your app behind a proxy that
+  forwards `/api/` to the trace server (the bundled nginx config does this)
+  and pass a relative endpoint — `createClient({ endpoint: '/api' })`. No
+  CORS involved.
+- *Cross-origin direct:* point at the server host. `POST /v1/ingest` is the
+  only CORS-enabled route on the server (`CT_CORS_ORIGIN`, default `*` —
+  scope it to your app's origin in production). Read endpoints deliberately
+  send no CORS headers.
+
+**Page lifecycle.** The client listens for `visibilitychange` (to `hidden`)
+and `pagehide` and eagerly flushes the queue with `fetch(..., { keepalive:
+true })`, so events queued moments before a tab closes or backgrounds are
+still delivered. Keepalive bodies are chunked under the browser's 64KB
+budget; an event too large for that budget alone falls back to a regular
+request (best effort). `shutdown()` removes the listeners. One residual
+window: a batch already in flight on the *regular* (non-keepalive) flusher
+when the page is torn down can still be cancelled by the browser.
+
+**API keys.** Don't embed `CT_API_KEY` in browser code — anything shipped to
+the client is public, and the key authorizes writes. Leave ingest open on a
+network you control, or front the server with your own authenticated proxy.
 
 ## Framework hooks
 

@@ -24,6 +24,12 @@ const DEFAULT_MAX_QUEUE = 5000;
 const DEFAULT_MAX_SESSIONS = 1000;
 const MAX_SEND_ATTEMPTS = 3;
 const BACKOFF_BASE_MS = 200;
+/**
+ * Browsers cap keepalive request bodies at 64KB (shared across in-flight
+ * keepalive requests). Chunk lifecycle flushes below it with headroom for
+ * the envelope and multi-byte characters.
+ */
+const KEEPALIVE_BODY_LIMIT = 57_344;
 
 export interface ClientOptions {
   /** Base URL of the context-trace server, e.g. 'http://localhost:4720'. */
@@ -183,6 +189,8 @@ export class ClientImpl implements Client {
   private queue: IngestEvent[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing: Promise<void> | null = null;
+  private onVisibilityChange: (() => void) | null = null;
+  private onPageHide: (() => void) | null = null;
   /**
    * Cached per-id session handles, so repeated startSession/session calls
    * for the same id (e.g. one per hook invocation in a stateless callback
@@ -216,6 +224,23 @@ export class ClientImpl implements Client {
       if (typeof maybeUnref === 'function') {
         maybeUnref.call(this.timer);
       }
+    }
+
+    // Browser page lifecycle: the interval flusher alone would lose whatever
+    // is queued when the tab closes or backgrounds. Flush eagerly (with
+    // fetch keepalive) on hide instead. No-op in Node, where `document` and
+    // a global addEventListener don't both exist.
+    if (
+      this.enabled &&
+      typeof document !== 'undefined' &&
+      typeof globalThis.addEventListener === 'function'
+    ) {
+      this.onVisibilityChange = () => {
+        if (document.visibilityState === 'hidden') this.lifecycleFlush();
+      };
+      this.onPageHide = () => this.lifecycleFlush();
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+      globalThis.addEventListener('pagehide', this.onPageHide);
     }
   }
 
@@ -318,7 +343,7 @@ export class ClientImpl implements Client {
     }
   }
 
-  private async send(batch: IngestEvent[]): Promise<void> {
+  private async send(batch: IngestEvent[], keepalive = false): Promise<void> {
     const fetchImpl = globalThis.fetch;
     if (typeof fetchImpl !== 'function') {
       throw new Error('context-trace: global fetch is not available in this environment');
@@ -330,11 +355,49 @@ export class ClientImpl implements Client {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
+      ...(keepalive ? { keepalive: true } : {}),
     });
     if (!res.ok) {
       throw new IngestHttpError(res.status);
     }
     await this.reportPartialRejections(res, batch);
+  }
+
+  /**
+   * Page is hiding or unloading: drain the queue NOW, fire-and-forget, in
+   * chunks small enough for the browser's 64KB keepalive body budget. An
+   * event too large even alone falls back to a regular fetch — modern
+   * browsers usually complete a fast same-session request after hide, and
+   * best-effort beats certain loss.
+   */
+  private lifecycleFlush(): void {
+    if (!this.enabled || this.queue.length === 0) return;
+    const events = this.queue.splice(0, this.queue.length);
+    let batch: IngestEvent[] = [];
+    let size = 20; // '{"events":[' + ']}' envelope headroom
+    for (const event of events) {
+      const eventSize = JSON.stringify(event).length + 1;
+      if (batch.length > 0 && (size + eventSize > KEEPALIVE_BODY_LIMIT || batch.length >= this.maxBatch)) {
+        void this.sendLifecycleBatch(batch);
+        batch = [];
+        size = 20;
+      }
+      batch.push(event);
+      size += eventSize;
+    }
+    if (batch.length > 0) void this.sendLifecycleBatch(batch);
+  }
+
+  private async sendLifecycleBatch(batch: IngestEvent[]): Promise<void> {
+    try {
+      await this.send(batch, true);
+    } catch {
+      try {
+        await this.send(batch, false);
+      } catch (err) {
+        this.reportError(err);
+      }
+    }
   }
 
   /**
@@ -368,6 +431,14 @@ export class ClientImpl implements Client {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.onVisibilityChange && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
+      this.onVisibilityChange = null;
+    }
+    if (this.onPageHide && typeof globalThis.removeEventListener === 'function') {
+      globalThis.removeEventListener('pagehide', this.onPageHide);
+      this.onPageHide = null;
     }
     await this.flush();
   }

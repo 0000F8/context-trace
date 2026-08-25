@@ -417,3 +417,115 @@ describe('option validation', () => {
     expect(events).toHaveLength(4);
   });
 });
+
+describe('browser page lifecycle', () => {
+  function stubBrowserEnv(visibility: 'visible' | 'hidden' = 'hidden') {
+    const docListeners = new Map<string, () => void>();
+    const winListeners = new Map<string, () => void>();
+    const doc = {
+      visibilityState: visibility,
+      addEventListener: (t: string, h: () => void) => docListeners.set(t, h),
+      removeEventListener: (t: string) => docListeners.delete(t),
+    };
+    vi.stubGlobal('document', doc);
+    vi.stubGlobal('addEventListener', (t: string, h: () => void) => winListeners.set(t, h));
+    vi.stubGlobal('removeEventListener', (t: string) => winListeners.delete(t));
+    return { doc, docListeners, winListeners };
+  }
+
+  async function settle() {
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  it('flushes with keepalive on pagehide and removes listeners on shutdown', async () => {
+    const { docListeners, winListeners } = stubBrowserEnv();
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const ct = createClient({ endpoint: 'http://x', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 'browser' });
+    const seg = session.segment({});
+    seg.section({ key: 'a', service: 's', serviceKind: 'other', content: 'hello' });
+    seg.record();
+
+    winListeners.get('pagehide')!();
+    await settle();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]![1] as RequestInit & { keepalive?: boolean };
+    expect(init.keepalive).toBe(true);
+    expect(eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?])).toHaveLength(2);
+
+    // queue drained: a later flush sends nothing more
+    await ct.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await ct.shutdown();
+    expect(docListeners.size).toBe(0);
+    expect(winListeners.size).toBe(0);
+  });
+
+  it('flushes on visibilitychange only when the document is hidden', async () => {
+    const { doc, docListeners } = stubBrowserEnv('visible');
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const ct = createClient({ endpoint: 'http://x', flushIntervalMs: 0 });
+    ct.startSession({ name: 'vis' });
+
+    docListeners.get('visibilitychange')!();
+    await settle();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    doc.visibilityState = 'hidden';
+    docListeners.get('visibilitychange')!();
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await ct.shutdown();
+  });
+
+  it('chunks lifecycle flushes under the 64KB keepalive body budget', async () => {
+    const { winListeners } = stubBrowserEnv();
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const ct = createClient({ endpoint: 'http://x', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 'big' });
+    for (let i = 0; i < 2; i++) {
+      const seg = session.segment({});
+      seg.section({ key: 'k' + i, service: 's', serviceKind: 'other', content: 'x'.repeat(40_000) });
+      seg.record();
+    }
+
+    winListeners.get('pagehide')!();
+    await settle();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const call of fetchMock.mock.calls) {
+      const init = call[1] as RequestInit & { keepalive?: boolean };
+      expect(init.keepalive).toBe(true);
+      expect(String(init.body).length).toBeLessThanOrEqual(57_344);
+    }
+  });
+
+  it('falls back to a plain request when the keepalive send fails', async () => {
+    const { winListeners } = stubBrowserEnv();
+    const errors: string[] = [];
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('keepalive body too large'))
+      .mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const ct = createClient({ endpoint: 'http://x', flushIntervalMs: 0, onError: (e) => errors.push(e.message) });
+    const session = ct.startSession({ name: 'fallback' });
+    const seg = session.segment({});
+    seg.section({ key: 'a', service: 's', serviceKind: 'other', content: 'y' });
+    seg.record();
+
+    winListeners.get('pagehide')!();
+    await settle();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const second = fetchMock.mock.calls[1]![1] as RequestInit & { keepalive?: boolean };
+    expect(second.keepalive).toBeUndefined();
+    expect(errors).toHaveLength(0);
+  });
+});
