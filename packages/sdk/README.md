@@ -70,7 +70,7 @@ Only `flush()` and `shutdown()` return promises. Everything else (`startSession`
 ## Delivery semantics
 
 - **Batching**: events are sent in arrival order, split into chunks of `maxBatch`.
-- **Retry**: a failed batch (network error or non-2xx response) is retried with exponential backoff (200ms, 400ms — 3 attempts total), then dropped and reported via `onError`. A dropped batch is never retried again on a later `flush()`.
+- **Retry**: network errors, `408`, `429`, and `5xx` responses are retried with exponential backoff (200ms, 400ms — 3 attempts total), then dropped and reported via `onError`. Other `4xx` responses (e.g. `400`, `401`, `404`) are treated as permanent — they're reported via `onError` and the batch is dropped immediately, without burning retries on a request that can't succeed. A dropped batch is never retried again on a later `flush()`.
 - **Backpressure**: the queue is bounded by `maxQueue`. On overflow the oldest queued event is dropped (not the newest) and `onError` fires, so recent activity is preserved over stale activity.
 - **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`.
 - **`enabled: false`**: turns the client into a complete no-op — useful for disabling tracing in tests or specific environments without changing call sites.

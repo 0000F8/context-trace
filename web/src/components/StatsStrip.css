@@ -1,0 +1,27 @@
+.stats-strip {
+  display: flex;
+  gap: 32px;
+  margin: 24px 0;
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.stats-strip__figure {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 2px;
+}
+
+.stats-strip__figure dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-strip__figure dt {
+  margin: 0;
+  font-size: var(--text-dense);
+  color: var(--ink-2);
+}

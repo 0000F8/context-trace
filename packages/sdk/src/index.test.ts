@@ -126,6 +126,44 @@ describe('retry then drop', () => {
   });
 });
 
+describe('non-retryable HTTP errors', () => {
+  it('drops immediately on a 4xx other than 408/429, without retrying', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('bad request', { status: 400 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, onError });
+    const session = ct.startSession({ name: 's' });
+    session.end();
+
+    await ct.flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+  });
+
+  it('still retries a 429', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('rate limited', { status: 429 }))
+      .mockResolvedValueOnce(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, onError });
+    const session = ct.startSession({ name: 's' });
+    session.end();
+
+    const flushPromise = ct.flush();
+    await vi.runAllTimersAsync();
+    await flushPromise;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(onError).not.toHaveBeenCalled();
+  });
+});
+
 describe('enabled: false', () => {
   it('no-ops everything and never calls fetch', async () => {
     const fetchMock = vi.fn();

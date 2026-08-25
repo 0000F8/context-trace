@@ -115,11 +115,36 @@ export interface Client {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    // Don't let a pending backoff sleep keep a Node process alive after the
+    // host is otherwise done. Guarded so this works unmodified in browsers,
+    // where timers have no unref().
+    const maybeUnref = (timer as unknown as { unref?: () => void }).unref;
+    if (typeof maybeUnref === 'function') {
+      maybeUnref.call(timer);
+    }
+  });
 }
 
 function backoffDelay(attempt: number): number {
   return BACKOFF_BASE_MS * 2 ** (attempt - 1);
+}
+
+/** Thrown by send() for a non-2xx HTTP response; carries the status for retry classification. */
+class IngestHttpError extends Error {
+  constructor(public readonly status: number) {
+    super(`context-trace: ingest request failed with status ${status}`);
+  }
+}
+
+/** 4xx other than 408 (timeout) and 429 (rate limit) won't succeed on retry. */
+function isRetryable(err: unknown): boolean {
+  if (err instanceof IngestHttpError) {
+    if (err.status === 408 || err.status === 429) return true;
+    return err.status < 400 || err.status >= 500;
+  }
+  return true;
 }
 
 export class ClientImpl implements Client {
@@ -220,7 +245,7 @@ export class ClientImpl implements Client {
         await this.send(batch);
         return;
       } catch (err) {
-        if (attempt >= MAX_SEND_ATTEMPTS) {
+        if (attempt >= MAX_SEND_ATTEMPTS || !isRetryable(err)) {
           this.reportError(err);
           return;
         }
@@ -243,7 +268,7 @@ export class ClientImpl implements Client {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`context-trace: ingest request failed with status ${res.status}`);
+      throw new IngestHttpError(res.status);
     }
   }
 

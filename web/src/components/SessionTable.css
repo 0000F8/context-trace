@@ -1,0 +1,45 @@
+.session-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-base);
+}
+
+.session-table thead th {
+  text-align: left;
+  font-weight: 600;
+  font-size: var(--text-dense);
+  color: var(--ink-2);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-table tbody td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+.session-table tbody tr {
+  cursor: pointer;
+}
+
+.session-table tbody tr:hover {
+  background: var(--bg);
+}
+
+.session-table tbody tr:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.session-table__name {
+  font-weight: 450;
+  color: var(--ink);
+}
+
+.session-table__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  max-width: 260px;
+}

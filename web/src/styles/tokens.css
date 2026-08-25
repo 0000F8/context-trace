@@ -1,0 +1,43 @@
+:root {
+  /* chrome — cool lab-bench neutrals, light UI */
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --ink: #17242e;
+  --ink-2: #5c6b76;
+  --line: #dde4e9;
+  --focus: #0f6b62;
+
+  /* service palette (data) — assigned at runtime by first-appearance order */
+  --service-0: #0f6b62; /* teal */
+  --service-1: #c4652a; /* copper */
+  --service-2: #3e5fa8; /* cobalt */
+  --service-3: #8a5fb0; /* violet */
+  --service-4: #b03a5b; /* madder */
+  --service-5: #5e7d2f; /* moss */
+  --service-6: #946f23; /* ochre */
+  --service-7: #4a7d8c; /* slate-cyan */
+
+  --service-0-soft: rgba(15, 107, 98, 0.14);
+  --service-1-soft: rgba(196, 101, 42, 0.14);
+  --service-2-soft: rgba(62, 95, 168, 0.14);
+  --service-3-soft: rgba(138, 95, 176, 0.14);
+  --service-4-soft: rgba(176, 58, 91, 0.14);
+  --service-5-soft: rgba(94, 125, 47, 0.14);
+  --service-6-soft: rgba(148, 111, 35, 0.14);
+  --service-7-soft: rgba(74, 125, 140, 0.14);
+
+  --madder-soft: rgba(176, 58, 91, 0.14);
+  --teal-soft: rgba(15, 107, 98, 0.14);
+
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --text-dense: 12px;
+  --text-base: 13px;
+  --text-intro: 15px;
+  --text-title-sm: 22px;
+  --text-title-lg: 28px;
+
+  --radius-max: 6px;
+  --shadow-max: 0 1px 2px rgba(23, 36, 46, 0.06);
+}

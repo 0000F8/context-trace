@@ -1,0 +1,54 @@
+.strata-grid {
+  position: relative;
+  padding-top: 4px;
+}
+
+.strata-grid--empty {
+  padding: 16px 0;
+  color: var(--ink-2);
+  font-size: var(--text-base);
+}
+
+.strata-grid__label {
+  font-family: var(--font-mono);
+  font-size: var(--text-dense);
+  fill: var(--ink);
+}
+
+.strata-grid__axis-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  fill: var(--ink-2);
+}
+
+.strata-grid g.is-dimmed {
+  opacity: 0.3;
+}
+
+.strata-cell {
+  cursor: pointer;
+}
+
+.strata-cell rect {
+  transition: opacity 150ms ease;
+}
+
+.strata-cell:hover rect,
+.strata-cell:focus-visible rect {
+  opacity: 0.85;
+}
+
+.strata-grid__tooltip {
+  position: absolute;
+  transform: translate(-8px, -100%);
+  background: var(--ink);
+  color: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 5;
+  margin-top: -4px;
+}

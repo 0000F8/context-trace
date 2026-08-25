@@ -1,0 +1,149 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: var(--text-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: var(--focus);
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+input {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+svg :focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+.app-shell {
+  min-height: 100%;
+}
+
+.app-header {
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.app-header__inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 14px 24px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.app-header__brand {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.state {
+  padding: 32px 0;
+  color: var(--ink-2);
+}
+
+.state--error {
+  color: var(--ink);
+}
+
+.state--error button {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: var(--radius-max);
+  padding: 6px 12px;
+}
+
+.state--error button:hover {
+  border-color: var(--focus);
+  color: var(--focus);
+}
+
+.state__title {
+  font-weight: 600;
+  margin: 0 0 4px;
+  color: var(--ink);
+}
+
+.state__body {
+  margin: 0;
+}
+
+.state__body code {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: var(--text-dense);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

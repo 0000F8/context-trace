@@ -1,0 +1,16 @@
+.service-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-dense);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.service-chip__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--chip-color, var(--ink-2));
+  flex: none;
+}

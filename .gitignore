@@ -8,3 +8,5 @@ data/
 .omc/
 .DS_Store
 *.log
+.playwright-mcp/
+*.png

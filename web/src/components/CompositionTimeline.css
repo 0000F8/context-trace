@@ -1,0 +1,63 @@
+.composition-timeline {
+  position: relative;
+  padding: 4px 0 0;
+}
+
+.chart-axis-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  fill: var(--ink-2);
+}
+
+.timeline__column {
+  transform-origin: bottom;
+  animation: rise 320ms ease-out both;
+  animation-delay: calc(var(--i, 0) * 24ms);
+}
+
+.timeline__column rect {
+  transition: opacity 150ms ease;
+}
+
+@keyframes rise {
+  from {
+    transform: scaleY(0);
+    opacity: 0;
+  }
+  to {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline__column {
+    animation: none;
+  }
+}
+
+.timeline__trend {
+  stroke: var(--focus);
+  stroke-width: 1.25;
+  opacity: 0.55;
+}
+
+.timeline__trend-dot {
+  fill: var(--focus);
+  opacity: 0.55;
+}
+
+.composition-timeline__tooltip {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  background: var(--ink);
+  color: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 5;
+  margin-top: -6px;
+}
