@@ -21,6 +21,7 @@ import { estimateTokens, fnv1a64, generateId } from '@context-trace/types';
 const DEFAULT_FLUSH_INTERVAL_MS = 2000;
 const DEFAULT_MAX_BATCH = 100;
 const DEFAULT_MAX_QUEUE = 5000;
+const DEFAULT_MAX_SESSIONS = 1000;
 const MAX_SEND_ATTEMPTS = 3;
 const BACKOFF_BASE_MS = 200;
 
@@ -34,6 +35,13 @@ export interface ClientOptions {
   maxBatch?: number;
   /** Max events buffered before the oldest events are dropped. Default 5000. */
   maxQueue?: number;
+  /**
+   * Max distinct session ids cached for the startSession/session handle
+   * cache (see `session(id)`). Bounds memory for long-lived clients that
+   * see many session ids over time. On overflow the least-recently-used
+   * session id is evicted. Default 1000.
+   */
+  maxSessions?: number;
   /** Called for dropped events, exhausted retries, and other non-fatal warnings. Never thrown from. */
   onError?: (err: Error) => void;
   /** When false, every capture call is a no-op and nothing is queued or sent. Default true. */
@@ -168,6 +176,7 @@ export class ClientImpl implements Client {
   private readonly flushIntervalMs: number;
   private readonly maxBatch: number;
   private readonly maxQueue: number;
+  private readonly maxSessions: number;
   private readonly onErrorCb: ((err: Error) => void) | undefined;
   private readonly enabled: boolean;
 
@@ -178,7 +187,11 @@ export class ClientImpl implements Client {
    * Cached per-id session handles, so repeated startSession/session calls
    * for the same id (e.g. one per hook invocation in a stateless callback
    * adapter) share one segment auto-counter instead of each minting a
-   * fresh handle whose segment() always starts back at index 0.
+   * fresh handle whose segment() always starts back at index 0. Bounded by
+   * maxSessions with LRU eviction (insertion order + re-insert-on-access,
+   * since Map iterates in insertion order) — evicted ids are never removed
+   * on session.end(), only on overflow, so a late segment recorded after
+   * end() can't accidentally reset an in-cache counter back to 0.
    */
   private readonly sessions = new Map<string, SessionHandleImpl>();
 
@@ -188,6 +201,7 @@ export class ClientImpl implements Client {
     this.flushIntervalMs = sanitizeOption(options.flushIntervalMs, DEFAULT_FLUSH_INTERVAL_MS, 0);
     this.maxBatch = sanitizeOption(options.maxBatch, DEFAULT_MAX_BATCH, 1);
     this.maxQueue = sanitizeOption(options.maxQueue, DEFAULT_MAX_QUEUE, 1);
+    this.maxSessions = sanitizeOption(options.maxSessions, DEFAULT_MAX_SESSIONS, 1);
     this.onErrorCb = options.onError;
     this.enabled = options.enabled ?? true;
 
@@ -245,10 +259,29 @@ export class ClientImpl implements Client {
   }
 
   private getOrCreateSessionHandle(id: string): SessionHandleImpl {
-    let handle = this.sessions.get(id);
-    if (!handle) {
-      handle = new SessionHandleImpl(this, id);
-      this.sessions.set(id, handle);
+    if (!this.enabled) {
+      // Nothing downstream reads from the cache when disabled (every
+      // capture call is already a no-op via enqueue()), so skip caching
+      // entirely rather than growing a Map that will never be consulted.
+      return new SessionHandleImpl(this, id);
+    }
+
+    const existing = this.sessions.get(id);
+    if (existing) {
+      // Re-insert to mark as most-recently-used: Map iterates in insertion
+      // order, so a delete+set moves this id to the "newest" end.
+      this.sessions.delete(id);
+      this.sessions.set(id, existing);
+      return existing;
+    }
+
+    const handle = new SessionHandleImpl(this, id);
+    this.sessions.set(id, handle);
+    if (this.sessions.size > this.maxSessions) {
+      const oldestId = this.sessions.keys().next().value;
+      if (oldestId !== undefined) {
+        this.sessions.delete(oldestId);
+      }
     }
     return handle;
   }

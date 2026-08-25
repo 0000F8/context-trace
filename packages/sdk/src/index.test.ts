@@ -247,6 +247,16 @@ describe('enabled: false', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('caches nothing: repeated session() calls for the same id never share a counter', () => {
+    // If a handle were being cached, this second segment() would come back
+    // with index 1 (continuing the shared counter) instead of 0.
+    const ct = createClient({ endpoint: 'http://localhost:4720', enabled: false });
+    const first = ct.session('sid').segment();
+    const second = ct.session('sid').segment();
+    expect(first.index).toBe(0);
+    expect(second.index).toBe(0);
+  });
 });
 
 describe('flush', () => {
@@ -356,6 +366,32 @@ describe('ct.session() re-bind', () => {
     }
     expect(recorded[0].data.index).toBe(0);
     expect(recorded[1].data.index).toBe(1);
+  });
+});
+
+describe('session handle cache (bounded by maxSessions, LRU eviction)', () => {
+  it('evicts the least-recently-used session id past maxSessions, keeping a recently-used counter intact', () => {
+    // segment() assigns its index synchronously before anything is queued
+    // or sent, so this test needs no fetch stub or flush() call.
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, maxSessions: 2 });
+
+    ct.session('s1').segment(); // cache (oldest -> newest): [s1]
+    const s2First = ct.session('s2').segment(); // cache: [s1, s2]
+    expect(s2First.index).toBe(0);
+
+    // Inserting s3 pushes the cache past maxSessions: 2, evicting the
+    // least-recently-used id. Neither s1 nor s2 was re-accessed since being
+    // cached, so insertion order is LRU order and s1 (oldest) is evicted.
+    ct.session('s3').segment(); // cache: [s2, s3]
+
+    // s2 is still cached: its handle (and segment auto-counter) survives.
+    const s2Second = ct.session('s2').segment();
+    expect(s2Second.index).toBe(1);
+
+    // s1 was evicted: re-binding mints a fresh handle whose counter starts
+    // over at 0 (it would be 1, matching s2's pattern, had it survived).
+    const s1Second = ct.session('s1').segment();
+    expect(s1Second.index).toBe(0);
   });
 });
 

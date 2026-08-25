@@ -203,7 +203,7 @@ export interface Stats {
  * Implemented on four 16-bit limbs instead of BigInt: the FNV prime is
  * 2^40 + 0x1b3, so v * prime mod 2^64 needs only the p0=0x1b3 and p2=0x100
  * limb products — every intermediate stays well inside double precision,
- * and this runs ~30x faster than the BigInt version on large inputs.
+ * and this runs severalfold faster than the BigInt version on large inputs.
  */
 export function fnv1a64(input: string): string {
   // offset basis 0xcbf29ce484222325 as limbs, least-significant first
