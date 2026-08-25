@@ -33,7 +33,14 @@ export function SectionDrawer({ sessionId, sectionKey, span, service, color, ini
   }, [sectionKey]);
 
   useEffect(() => {
-    if (cache.has(activeIndex)) return;
+    if (cache.has(activeIndex)) {
+      // Already cached for the current tick — nothing in flight, so the
+      // loading flag must reflect that (it may still be true from a prior
+      // tick whose fetch was cancelled before it could clear it).
+      setLoading(false);
+      setError(null);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);

@@ -4,7 +4,7 @@ import type { SegmentDetail } from '@context-trace/types';
 import { getSegmentDetail, getTrace } from '../lib/api';
 import { useFetch } from '../lib/useFetch';
 import { assignServiceColors, deriveServiceOrder } from '../lib/colors';
-import { buildCellStates, groupSpansByService } from '../lib/strata';
+import { buildCellStates, findPreviousSegment, groupSpansByService } from '../lib/strata';
 import { COLUMN_WIDTH, ROW_LABEL_WIDTH } from '../lib/layout';
 import { LeftRail } from '../components/LeftRail';
 import { CompositionTimeline } from '../components/CompositionTimeline';
@@ -49,7 +49,15 @@ export function TraceViewPage() {
   const groups = useMemo(() => (trace ? groupSpansByService(trace.spans, serviceOrder) : []), [trace, serviceOrder]);
 
   useEffect(() => {
-    if (!trace || selectedIndex == null || segmentDetails.has(selectedIndex)) return;
+    if (!trace || selectedIndex == null) return;
+    if (segmentDetails.has(selectedIndex)) {
+      // Already cached for the current selection — nothing in flight, so the
+      // loading flag must reflect that (it may still be true from a prior
+      // selection whose fetch was cancelled before it could clear it).
+      setDetailLoading(false);
+      setDetailError(null);
+      return;
+    }
     let cancelled = false;
     setDetailLoading(true);
     setDetailError(null);
@@ -150,7 +158,7 @@ export function TraceViewPage() {
       </div>
       <Inspector
         segment={selectedSegment}
-        previousSegment={selectedIndex != null && selectedIndex > 0 ? (trace.segments.find((s) => s.index === selectedIndex - 1) ?? null) : null}
+        previousSegment={selectedIndex != null ? findPreviousSegment(trace.segments, selectedIndex) : null}
         detail={selectedDetail}
         loading={detailLoading}
         error={detailError}

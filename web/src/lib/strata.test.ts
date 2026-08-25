@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildCellStates, groupSpansByService } from './strata';
-import type { CompiledTrace, TraceSpan } from '@context-trace/types';
+import { buildCellStates, findPreviousSegment, groupSpansByService } from './strata';
+import type { CompiledTrace, TraceSegment, TraceSpan } from '@context-trace/types';
 
 describe('buildCellStates', () => {
   it('maps add/change/carry/remove ops to cell states per segment', () => {
@@ -88,5 +88,43 @@ describe('groupSpansByService', () => {
     const spans = [span({ key: 'k1', service: 'zeta' }), span({ key: 'k2', service: 'memory' })];
     const groups = groupSpansByService(spans, ['memory']);
     expect(groups.map((g) => g.service)).toEqual(['memory', 'zeta']);
+  });
+});
+
+describe('findPreviousSegment', () => {
+  function segment(index: number): TraceSegment {
+    return {
+      id: `s${index}`,
+      index,
+      kind: 'llm_call',
+      timestamp: '2026-01-01T00:00:00Z',
+      totalTokens: 0,
+      sectionCount: 0,
+      services: [],
+      ops: [],
+    };
+  }
+
+  it('finds the largest index strictly less than the target with sparse indexes', () => {
+    const segments = [segment(0), segment(2), segment(5), segment(9)];
+    expect(findPreviousSegment(segments, 9)!.index).toBe(5);
+    expect(findPreviousSegment(segments, 5)!.index).toBe(2);
+    expect(findPreviousSegment(segments, 2)!.index).toBe(0);
+  });
+
+  it('is order-independent (does not assume the array is pre-sorted)', () => {
+    const segments = [segment(9), segment(0), segment(5), segment(2)];
+    expect(findPreviousSegment(segments, 9)!.index).toBe(5);
+  });
+
+  it('returns null when the target is the first segment', () => {
+    const segments = [segment(0), segment(2)];
+    expect(findPreviousSegment(segments, 0)).toBeNull();
+  });
+
+  it('is not fooled by target - 1 when that index does not exist', () => {
+    // target-1 (index 4) was never recorded; the true predecessor is index 2.
+    const segments = [segment(0), segment(2), segment(5)];
+    expect(findPreviousSegment(segments, 5)!.index).toBe(2);
   });
 });

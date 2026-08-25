@@ -4,7 +4,9 @@ services:
       context: .
       dockerfile: server/Dockerfile
     ports:
-      - "4720:4720"
+      # Loopback only: the web container reaches the server over the compose
+      # network; this mapping exists solely for local SDK development.
+      - "127.0.0.1:4720:4720"
     volumes:
       - ctdata:/data
     restart: unless-stopped

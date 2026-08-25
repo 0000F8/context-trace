@@ -95,6 +95,34 @@ describe('positions from call order', () => {
   });
 });
 
+describe('duplicate section keys', () => {
+  it('dedupes by key at record() time, last write wins, and warns via onError', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, onError });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'mem:profile', service: 'memory', serviceKind: 'memory', content: 'v1' });
+    seg.section({ key: 'other', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.section({ key: 'mem:profile', service: 'memory', serviceKind: 'memory', content: 'v2' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recordedEvent = events.find((e) => e.type === 'segment.recorded');
+    if (recordedEvent?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recordedEvent.data.sections.map((s) => [s.key, s.content, s.position])).toEqual([
+      ['mem:profile', 'v2', 0],
+      ['other', 'x', 1],
+    ]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+  });
+});
+
 describe('retry then drop', () => {
   it('retries on failure with backoff, then drops the batch and calls onError', async () => {
     const fetchMock = vi
@@ -160,6 +188,44 @@ describe('non-retryable HTTP errors', () => {
     await flushPromise;
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+describe('partial rejection', () => {
+  it('reports via onError when the server accepts 200 but rejects some events', async () => {
+    const rejectResponse = new Response(
+      JSON.stringify({ accepted: 1, rejected: [{ index: 1, reason: 'unknown sessionId' }] }),
+      { status: 200 },
+    );
+    const fetchMock = vi.fn().mockResolvedValue(rejectResponse);
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, onError });
+    const session = ct.startSession({ name: 's' }); // index 0: session.started
+    const seg = session.segment({ kind: 'llm_call' }); // index 1: segment.recorded
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+
+    await ct.flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    const err = onError.mock.calls[0]?.[0] as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain('unknown sessionId');
+  });
+
+  it('tolerates a non-JSON 200 response without throwing', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('not json', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, onError });
+    ct.startSession({ name: 's' });
+
+    await expect(ct.flush()).resolves.toBeUndefined();
     expect(onError).not.toHaveBeenCalled();
   });
 });
@@ -260,5 +326,58 @@ describe('ct.session() re-bind', () => {
     expect(events[0]?.type).toBe('segment.recorded');
     if (events[0]?.type !== 'segment.recorded') throw new Error('unreachable');
     expect(events[0].data.sessionId).toBe('existing-session-id');
+  });
+
+  it('caches the handle per session id, so repeated calls share one segment auto-counter', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+
+    // Simulates a stateless hook adapter re-binding on every invocation
+    // instead of holding a SessionHandle in memory across calls.
+    const seg1 = ct.session('shared-session').segment({ kind: 'llm_call' });
+    seg1.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg1.record();
+
+    const seg2 = ct.session('shared-session').segment({ kind: 'llm_call' });
+    seg2.section({ key: 'b', service: 'svc', serviceKind: 'other', content: 'y' });
+    seg2.record();
+
+    await ct.flush();
+
+    const events = fetchMock.mock.calls.flatMap((call) =>
+      eventsFromCall(call as unknown as [string, RequestInit?]),
+    );
+    const recorded = events.filter((e) => e.type === 'segment.recorded');
+    expect(recorded).toHaveLength(2);
+    if (recorded[0]?.type !== 'segment.recorded' || recorded[1]?.type !== 'segment.recorded') {
+      throw new Error('unreachable');
+    }
+    expect(recorded[0].data.index).toBe(0);
+    expect(recorded[1].data.index).toBe(1);
+  });
+});
+
+describe('option validation', () => {
+  it('falls back to the default maxBatch instead of looping forever on maxBatch: 0', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, maxBatch: 0 });
+    const session = ct.startSession({ name: 's' });
+    for (let i = 0; i < 3; i++) {
+      const seg = session.segment({ kind: 'llm_call' });
+      seg.section({ key: `k${i}`, service: 'svc', serviceKind: 'other', content: 'x' });
+      seg.record();
+    }
+
+    await expect(ct.flush()).resolves.toBeUndefined();
+
+    // Falls back to the default batch size (100), so all 4 events go out
+    // in a single request rather than an infinite loop of empty splices.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    expect(events).toHaveLength(4);
   });
 });

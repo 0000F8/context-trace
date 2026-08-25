@@ -1,4 +1,21 @@
-import type { CompiledTrace, TraceSpan } from '@context-trace/types';
+import type { CompiledTrace, TraceSegment, TraceSpan } from '@context-trace/types';
+
+/**
+ * The segment immediately preceding `targetIndex` in sorted-index order —
+ * i.e. the largest index strictly less than `targetIndex`, NOT simply
+ * `targetIndex - 1`. Segment indexes can be sparse (client-assigned), and
+ * this is what the server actually diffs a segment against, so the token
+ * delta shown in the UI must be computed the same way.
+ */
+export function findPreviousSegment(segments: TraceSegment[], targetIndex: number): TraceSegment | null {
+  let prev: TraceSegment | null = null;
+  for (const segment of segments) {
+    if (segment.index < targetIndex && (prev === null || segment.index > prev.index)) {
+      prev = segment;
+    }
+  }
+  return prev;
+}
 
 export type CellState = 'added' | 'changed' | 'carried' | 'removed';
 

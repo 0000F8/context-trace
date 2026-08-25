@@ -1,31 +1,60 @@
 import { describe, expect, it } from 'vitest';
-import { assignServiceColors, deriveServiceOrder, hexToRgba, SERVICE_PALETTE, softColorFor } from './colors';
+import {
+  assignServiceColors,
+  colorForService,
+  deriveServiceOrder,
+  hexToRgba,
+  paletteSlotForService,
+  SERVICE_PALETTE,
+  softColorFor,
+} from './colors';
 import type { CompiledTrace } from '@context-trace/types';
 
+describe('colorForService / paletteSlotForService', () => {
+  it('is deterministic for a given service name', () => {
+    expect(colorForService('memory')).toBe(colorForService('memory'));
+    expect(paletteSlotForService('memory')).toBe(paletteSlotForService('memory'));
+  });
+
+  it('always returns a slot within the palette', () => {
+    const paletteColors = SERVICE_PALETTE.map((p) => p.base);
+    expect(paletteColors).toContain(colorForService('retrieval'));
+    const slot = paletteSlotForService('retrieval');
+    expect(slot).toBeGreaterThanOrEqual(0);
+    expect(slot).toBeLessThan(SERVICE_PALETTE.length);
+  });
+
+  it('does not depend on first-appearance order', () => {
+    const fromOneOrder = assignServiceColors(['zeta', 'memory', 'retrieval']);
+    const fromAnotherOrder = assignServiceColors(['retrieval', 'memory', 'zeta']);
+    for (const name of ['memory', 'retrieval', 'zeta']) {
+      expect(fromOneOrder.get(name)).toBe(fromAnotherOrder.get(name));
+      expect(fromOneOrder.get(name)).toBe(colorForService(name));
+    }
+  });
+});
+
 describe('assignServiceColors', () => {
-  it('assigns the first service to the first palette color', () => {
-    const map = assignServiceColors(['memory']);
-    expect(map.get('memory')).toBe(SERVICE_PALETTE[0]!.base);
-  });
-
-  it('assigns distinct services to distinct palette slots in order', () => {
+  it('maps each service to its deterministic color', () => {
     const map = assignServiceColors(['memory', 'retrieval', 'tools']);
-    expect(map.get('memory')).toBe(SERVICE_PALETTE[0]!.base);
-    expect(map.get('retrieval')).toBe(SERVICE_PALETTE[1]!.base);
-    expect(map.get('tools')).toBe(SERVICE_PALETTE[2]!.base);
+    expect(map.get('memory')).toBe(colorForService('memory'));
+    expect(map.get('retrieval')).toBe(colorForService('retrieval'));
+    expect(map.get('tools')).toBe(colorForService('tools'));
   });
 
-  it('keeps a repeated service stable on its original color', () => {
+  it('keeps a repeated service stable on its one color and dedups', () => {
     const map = assignServiceColors(['memory', 'retrieval', 'memory']);
-    expect(map.get('memory')).toBe(SERVICE_PALETTE[0]!.base);
+    expect(map.get('memory')).toBe(colorForService('memory'));
     expect(map.size).toBe(2);
   });
 
-  it('cycles the palette after 8 distinct services', () => {
-    const names = Array.from({ length: 9 }, (_, i) => `svc-${i}`);
-    const map = assignServiceColors(names);
-    expect(map.get('svc-0')).toBe(SERVICE_PALETTE[0]!.base);
-    expect(map.get('svc-8')).toBe(SERVICE_PALETTE[0]!.base);
+  it('agrees between an alphabetical list (server order) and a first-appearance list (trace order)', () => {
+    const names = ['memory', 'retrieval', 'tools'];
+    const alphabetical = assignServiceColors([...names].sort());
+    const firstAppearance = assignServiceColors(['tools', 'memory', 'retrieval']);
+    for (const name of names) {
+      expect(alphabetical.get(name)).toBe(firstAppearance.get(name));
+    }
   });
 });
 

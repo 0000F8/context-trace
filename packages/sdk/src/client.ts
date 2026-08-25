@@ -8,6 +8,7 @@
 import type {
   IngestEvent,
   IngestRequest,
+  IngestResponse,
   Section,
   SectionRole,
   SegmentKind,
@@ -147,6 +148,20 @@ function isRetryable(err: unknown): boolean {
   return true;
 }
 
+/**
+ * Validate a numeric option: NaN, non-finite, or below `min` (e.g. a
+ * maxBatch of 0, which would make drain() splice zero-length chunks
+ * forever) falls back to the default instead of being clamped, since a
+ * value that low almost certainly indicates a misconfiguration rather than
+ * an intentional tiny bound.
+ */
+function sanitizeOption(value: number | undefined, fallback: number, min: number): number {
+  if (value === undefined || !Number.isFinite(value) || value < min) {
+    return fallback;
+  }
+  return Math.floor(value);
+}
+
 export class ClientImpl implements Client {
   private readonly endpoint: string;
   private readonly apiKey: string | undefined;
@@ -159,13 +174,20 @@ export class ClientImpl implements Client {
   private queue: IngestEvent[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing: Promise<void> | null = null;
+  /**
+   * Cached per-id session handles, so repeated startSession/session calls
+   * for the same id (e.g. one per hook invocation in a stateless callback
+   * adapter) share one segment auto-counter instead of each minting a
+   * fresh handle whose segment() always starts back at index 0.
+   */
+  private readonly sessions = new Map<string, SessionHandleImpl>();
 
   constructor(options: ClientOptions) {
     this.endpoint = options.endpoint.replace(/\/+$/, '');
     this.apiKey = options.apiKey;
-    this.flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
-    this.maxBatch = options.maxBatch ?? DEFAULT_MAX_BATCH;
-    this.maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
+    this.flushIntervalMs = sanitizeOption(options.flushIntervalMs, DEFAULT_FLUSH_INTERVAL_MS, 0);
+    this.maxBatch = sanitizeOption(options.maxBatch, DEFAULT_MAX_BATCH, 1);
+    this.maxQueue = sanitizeOption(options.maxQueue, DEFAULT_MAX_QUEUE, 1);
     this.onErrorCb = options.onError;
     this.enabled = options.enabled ?? true;
 
@@ -215,11 +237,20 @@ export class ClientImpl implements Client {
       };
       this.enqueue({ type: 'session.started', data: session });
     }
-    return new SessionHandleImpl(this, id);
+    return this.getOrCreateSessionHandle(id);
   }
 
   session(id: string): SessionHandle {
-    return new SessionHandleImpl(this, id);
+    return this.getOrCreateSessionHandle(id);
+  }
+
+  private getOrCreateSessionHandle(id: string): SessionHandleImpl {
+    let handle = this.sessions.get(id);
+    if (!handle) {
+      handle = new SessionHandleImpl(this, id);
+      this.sessions.set(id, handle);
+    }
+    return handle;
   }
 
   async flush(): Promise<void> {
@@ -270,6 +301,34 @@ export class ClientImpl implements Client {
     if (!res.ok) {
       throw new IngestHttpError(res.status);
     }
+    await this.reportPartialRejections(res, batch);
+  }
+
+  /**
+   * A 200 response can still partially reject the batch (malformed events
+   * mixed with good ones): { accepted, rejected: [{ index, reason }] }.
+   * Surface those drops via onError instead of silently discarding them.
+   * Tolerates a non-JSON or unparsable body.
+   */
+  private async reportPartialRejections(res: Response, batch: IngestEvent[]): Promise<void> {
+    let parsed: IngestResponse | undefined;
+    try {
+      parsed = (await res.json()) as IngestResponse;
+    } catch {
+      return;
+    }
+    const rejected = parsed?.rejected;
+    if (!rejected || rejected.length === 0) return;
+    const reasons = rejected
+      .map(({ index, reason }) => {
+        const event = batch[index];
+        const label = event ? event.type : `#${index}`;
+        return `${label}: ${reason}`;
+      })
+      .join('; ');
+    this.reportError(
+      new Error(`context-trace: server rejected ${rejected.length} event(s): ${reasons}`),
+    );
   }
 
   async shutdown(): Promise<void> {
@@ -373,7 +432,10 @@ class SegmentBuilderImpl implements SegmentBuilder {
         return;
       }
       this.recorded = true;
-      const sections = this.sections.map((section, position) => ({ ...section, position }));
+      const sections = this.dedupeByKey(this.sections).map((section, position) => ({
+        ...section,
+        position,
+      }));
       const segment: SegmentWithSections = {
         id: this.id,
         sessionId: this.sessionId,
@@ -389,5 +451,36 @@ class SegmentBuilderImpl implements SegmentBuilder {
     } catch (err) {
       this.client.reportError(err);
     }
+  }
+
+  /**
+   * A duplicate `key` within one segment makes the server discard the
+   * whole snapshot (sections are keyed per segment). Collapse duplicates
+   * here instead: the last write for a key wins its content, but keeps the
+   * ordinal slot of its first appearance so unrelated positions don't
+   * shuffle around a duplicate that shows up later in the call order.
+   */
+  private dedupeByKey(sections: Section[]): Section[] {
+    const slotByKey = new Map<string, number>();
+    const result: Section[] = [];
+    let duplicateCount = 0;
+    for (const section of sections) {
+      const existingSlot = slotByKey.get(section.key);
+      if (existingSlot !== undefined) {
+        result[existingSlot] = section;
+        duplicateCount += 1;
+      } else {
+        slotByKey.set(section.key, result.length);
+        result.push(section);
+      }
+    }
+    if (duplicateCount > 0) {
+      this.client.reportError(
+        new Error(
+          `context-trace: segment ${this.id} had ${duplicateCount} duplicate section key(s); last write wins`,
+        ),
+      );
+    }
+    return result;
   }
 }

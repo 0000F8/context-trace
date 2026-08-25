@@ -229,6 +229,121 @@ describe('app', () => {
     expect((await app.request(`${baseUrl()}/v1/sessions/nope`, { method: 'DELETE' })).status).toBe(404);
   });
 
+  describe('duplicate section keys', () => {
+    it('rejects a segment with a duplicate section key rather than hitting the DB constraint', async () => {
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({
+              id: 'seg-0',
+              sessionId: 's1',
+              index: 0,
+              sections: [
+                { key: 'dup', content: 'first' },
+                { key: 'ok', content: 'fine' },
+                { key: 'dup', content: 'second' },
+              ],
+            }),
+          ],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.accepted).toBe(1); // session.started only
+      expect(body.rejected).toEqual([{ index: 1, reason: 'duplicate section key: dup' }]);
+
+      // The segment must not have been partially written.
+      const detailRes = await app.request(`${baseUrl()}/v1/sessions/s1`);
+      const detail = await detailRes.json();
+      expect(detail.segments).toHaveLength(0);
+    });
+  });
+
+  describe('session.ended for an unknown session', () => {
+    it('is rejected as a no-op rather than fabricating a stub session', async () => {
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'session.ended', data: { sessionId: 'ghost', endedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(0);
+      expect(body.rejected).toEqual([{ index: 0, reason: 'unknown session' }]);
+
+      const detailRes = await app.request(`${baseUrl()}/v1/sessions/ghost`);
+      expect(detailRes.status).toBe(404);
+    });
+
+    it('does not resurrect a session that was just deleted by a late session.ended event', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+      await app.request(`${baseUrl()}/v1/sessions/s1`, { method: 'DELETE' });
+
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'session.ended', data: { sessionId: 's1', endedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+      expect((await res.json()).rejected).toEqual([{ index: 0, reason: 'unknown session' }]);
+
+      const detailRes = await app.request(`${baseUrl()}/v1/sessions/s1`);
+      expect(detailRes.status).toBe(404);
+    });
+  });
+
+  describe('segment index validation', () => {
+    it('rejects a non-integer segment.index on ingest', async () => {
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 1.5, sections: [{ key: 'a', content: 'x' }] }),
+          ],
+        }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(1);
+      expect(body.rejected).toEqual([{ index: 1, reason: 'segment.index must be an integer >= 0' }]);
+    });
+
+    it('rejects non-integer :index route params (e.g. "1.5", "0abc") with 404 instead of truncating', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 0, sections: [{ key: 'a', content: 'x' }] }),
+            makeSegmentEvent({ id: 'seg-1', sessionId: 's1', index: 1, sections: [{ key: 'a', content: 'y' }] }),
+          ],
+        }),
+      });
+
+      // Sanity: the real integer index 0 resolves.
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1/segments/0`)).status).toBe(200);
+
+      // "1.5" must not silently resolve to segment 1 via parseInt truncation.
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1/segments/1.5`)).status).toBe(404);
+      // "0abc" must not silently resolve to segment 0 via parseInt prefix-parsing.
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1/segments/0abc`)).status).toBe(404);
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1/segments/-1`)).status).toBe(404);
+    });
+  });
+
   it('answers /healthz without auth even when an API key is configured', async () => {
     const keyedApp = createApp(openDb(':memory:'), { apiKey: 'secret' });
     const res = await keyedApp.request(`${baseUrl()}/healthz`);
@@ -237,25 +352,300 @@ describe('app', () => {
   });
 
   describe('auth', () => {
-    it('is open when CT_API_KEY is unset', async () => {
+    it('is open (writes included) when CT_API_KEY is unset', async () => {
       const res = await app.request(`${baseUrl()}/v1/stats`);
       expect(res.status).toBe(200);
     });
 
-    it('returns 401 when a key is required and missing or wrong', async () => {
+    it('keeps all GET endpoints open even when a key is configured, so the dashboard works with auth enabled', async () => {
       const keyedApp = createApp(openDb(':memory:'), { apiKey: 'secret' });
 
-      const missing = await keyedApp.request(`${baseUrl()}/v1/stats`);
-      expect(missing.status).toBe(401);
-
-      const wrong = await keyedApp.request(`${baseUrl()}/v1/stats`, { headers: { 'x-api-key': 'wrong' } });
-      expect(wrong.status).toBe(401);
+      expect((await keyedApp.request(`${baseUrl()}/v1/stats`)).status).toBe(200);
+      expect((await keyedApp.request(`${baseUrl()}/v1/sessions`)).status).toBe(200);
+      expect((await keyedApp.request(`${baseUrl()}/v1/sessions/nope`)).status).toBe(404); // reached the handler, not 401
     });
 
-    it('returns 200 when the correct key is provided', async () => {
+    it('requires x-api-key on POST /v1/ingest when a key is configured', async () => {
       const keyedApp = createApp(openDb(':memory:'), { apiKey: 'secret' });
-      const res = await keyedApp.request(`${baseUrl()}/v1/stats`, { headers: { 'x-api-key': 'secret' } });
-      expect(res.status).toBe(200);
+      const ingestBody = JSON.stringify({
+        events: [{ type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+      });
+
+      const missing = await keyedApp.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: ingestBody,
+      });
+      expect(missing.status).toBe(401);
+
+      const wrong = await keyedApp.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'wrong' },
+        body: ingestBody,
+      });
+      expect(wrong.status).toBe(401);
+
+      const right = await keyedApp.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'secret' },
+        body: ingestBody,
+      });
+      expect(right.status).toBe(200);
+    });
+
+    it('requires x-api-key on DELETE /v1/sessions/:id when a key is configured', async () => {
+      const keyedDb = openDb(':memory:');
+      const keyedApp = createApp(keyedDb, { apiKey: 'secret' });
+      await keyedApp.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'secret' },
+        body: JSON.stringify({
+          events: [{ type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+
+      const missing = await keyedApp.request(`${baseUrl()}/v1/sessions/s1`, { method: 'DELETE' });
+      expect(missing.status).toBe(401);
+
+      const right = await keyedApp.request(`${baseUrl()}/v1/sessions/s1`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': 'secret' },
+      });
+      expect(right.status).toBe(200);
+    });
+  });
+
+  describe('CORS', () => {
+    it('sends Access-Control-Allow-Origin on POST /v1/ingest but not on GET/DELETE routes', async () => {
+      const origin = 'https://evil.example.com';
+
+      const ingestRes = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin },
+        body: JSON.stringify({ events: [] }),
+      });
+      expect(ingestRes.headers.get('access-control-allow-origin')).toBe('*');
+
+      const preflight = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'OPTIONS',
+        headers: {
+          origin,
+          'access-control-request-method': 'POST',
+        },
+      });
+      expect(preflight.headers.get('access-control-allow-origin')).toBe('*');
+
+      const getRes = await app.request(`${baseUrl()}/v1/sessions`, { headers: { origin } });
+      expect(getRes.status).toBe(200);
+      expect(getRes.headers.get('access-control-allow-origin')).toBeNull();
+
+      const deleteRes = await app.request(`${baseUrl()}/v1/sessions/nope`, { method: 'DELETE', headers: { origin } });
+      expect(deleteRes.headers.get('access-control-allow-origin')).toBeNull();
+    });
+  });
+
+  describe('ingest caps', () => {
+    it('rejects a section with content over 262144 chars but accepts exactly the limit', async () => {
+      const overLimit = 'x'.repeat(262_145);
+      const atLimit = 'x'.repeat(262_144);
+
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 'seg-over', sessionId: 's1', index: 0, sections: [{ key: 'a', content: overLimit }] }),
+            makeSegmentEvent({ id: 'seg-at', sessionId: 's1', index: 1, sections: [{ key: 'a', content: atLimit }] }),
+          ],
+        }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(2); // session.started + the at-limit segment
+      expect(body.rejected).toHaveLength(1);
+      expect(body.rejected[0].index).toBe(1);
+      expect(body.rejected[0].reason).toMatch(/content exceeds max length/);
+    });
+
+    it('rejects a segment with more than 500 sections but accepts exactly 500', async () => {
+      const tooMany = Array.from({ length: 501 }, (_, i) => ({ key: `k${i}`, content: 'x' }));
+      const atLimit = Array.from({ length: 500 }, (_, i) => ({ key: `k${i}`, content: 'x' }));
+
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 'seg-over', sessionId: 's1', index: 0, sections: tooMany }),
+            makeSegmentEvent({ id: 'seg-at', sessionId: 's1', index: 1, sections: atLimit }),
+          ],
+        }),
+      });
+      const body = await res.json();
+      expect(body.rejected).toHaveLength(1);
+      expect(body.rejected[0].index).toBe(1);
+      expect(body.rejected[0].reason).toMatch(/sections exceeds max/);
+      expect(body.accepted).toBe(2);
+    });
+
+    it('rejects an over-length key/service/name/label/id string', async () => {
+      const longString = 'x'.repeat(513);
+
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: longString, name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            { type: 'session.started', data: { id: 's2', name: longString, startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 's3-seg', sessionId: 's3', index: 0, sections: [{ key: longString, content: 'x' }] }),
+            makeSegmentEvent({ id: 's3-seg2', sessionId: 's3', index: 1, sections: [{ key: 'a', service: longString, content: 'x' }] }),
+          ],
+        }),
+      });
+      const body = await res.json();
+      expect(body.rejected).toHaveLength(4);
+      expect(body.accepted).toBe(0);
+    });
+  });
+
+  describe('content hash integrity', () => {
+    it('recomputes contentHash server-side from content, ignoring a forged client hash', async () => {
+      const segmentEvent = (id: string, index: number, forgedHash: string) => ({
+        type: 'segment.recorded' as const,
+        data: {
+          id,
+          sessionId: 's1',
+          index,
+          kind: 'llm_call' as const,
+          timestamp: new Date(2026, 0, 1, 0, index).toISOString(),
+          sections: [
+            {
+              key: 'a',
+              service: 'svc',
+              serviceKind: 'memory',
+              position: 0,
+              content: 'hello', // identical real content across both segments
+              contentHash: forgedHash, // deliberately wrong / inconsistent client-supplied hash
+              tokens: 5,
+            },
+          ],
+        },
+      });
+
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            segmentEvent('seg-0', 0, fnv1a64('WRONG-1')),
+            segmentEvent('seg-1', 1, fnv1a64('WRONG-2')), // a different forged hash than seg-0's
+          ],
+        }),
+      });
+
+      // If the server trusted the (differing) forged hashes, this would read 'changed'.
+      // Since it recomputes from the identical real content, it must read 'carried'.
+      const segRes = await app.request(`${baseUrl()}/v1/sessions/s1/segments/1`);
+      const seg = await segRes.json();
+      expect(seg.sections[0].state).toBe('carried');
+      expect(seg.sections[0].contentHash).toBe(fnv1a64('hello'));
+    });
+
+    it('keeps the client-supplied hash when content is omitted', async () => {
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            {
+              type: 'segment.recorded',
+              data: {
+                id: 'seg-0',
+                sessionId: 's1',
+                index: 0,
+                kind: 'llm_call',
+                timestamp: new Date(2026, 0, 1).toISOString(),
+                sections: [
+                  { key: 'a', service: 'svc', serviceKind: 'memory', position: 0, contentHash: 'client-ref-hash', tokens: 3 },
+                ],
+              },
+            },
+          ],
+        }),
+      });
+      expect((await res.json()).accepted).toBe(2);
+
+      const segRes = await app.request(`${baseUrl()}/v1/sessions/s1/segments/0`);
+      const seg = await segRes.json();
+      expect(seg.sections[0].contentHash).toBe('client-ref-hash');
+      expect(seg.sections[0].content).toBeUndefined();
+    });
+  });
+
+  describe('session summary aggregates (SQL-only, no content loading)', () => {
+    it('computes segment/section counts, latest vs peak tokens, and distinct services correctly', async () => {
+      // segment 0: total 8 tokens (a:4 + b:4), services memory-svc + retrieval-svc
+      // segment 1: total 42 tokens (a:2 + huge:40) -- the peak, via a service only present here
+      // segment 2: total 2 tokens (a:2 only) -- the latest, b and huge both dropped
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'agg-test', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({
+              id: 'seg-0',
+              sessionId: 's1',
+              index: 0,
+              sections: [
+                { key: 'a', content: 'abcd', service: 'memory-svc' },
+                { key: 'b', content: 'wxyz', service: 'retrieval-svc' },
+              ],
+            }),
+            makeSegmentEvent({
+              id: 'seg-1',
+              sessionId: 's1',
+              index: 1,
+              sections: [
+                { key: 'a', content: 'ab', service: 'memory-svc' },
+                { key: 'huge', content: 'x'.repeat(40), service: 'huge-svc' },
+              ],
+            }),
+            makeSegmentEvent({
+              id: 'seg-2',
+              sessionId: 's1',
+              index: 2,
+              sections: [{ key: 'a', content: 'ab', service: 'memory-svc' }],
+            }),
+          ],
+        }),
+      });
+
+      const sessionsRes = await app.request(`${baseUrl()}/v1/sessions`);
+      const sessionsBody = await sessionsRes.json();
+      const summary = sessionsBody.sessions.find((s: { id: string }) => s.id === 's1');
+      expect(summary).toMatchObject({
+        segmentCount: 3,
+        sectionCount: 5,
+        totalTokens: 2, // latest segment (index 2)
+        peakTokens: 42, // segment 1, not the latest
+        services: ['huge-svc', 'memory-svc', 'retrieval-svc'],
+      });
+
+      // getSessionSummary (used by list) must agree with getSessionDetail's summary fields.
+      const detailRes = await app.request(`${baseUrl()}/v1/sessions/s1`);
+      const detail = await detailRes.json();
+      expect(detail).toMatchObject({
+        segmentCount: 3,
+        sectionCount: 5,
+        totalTokens: 2,
+        peakTokens: 42,
+        services: ['huge-svc', 'memory-svc', 'retrieval-svc'],
+      });
     });
   });
 });

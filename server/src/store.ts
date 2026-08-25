@@ -52,6 +52,16 @@ interface SectionRow {
   metadata: string | null;
 }
 
+/** Section columns excluding `content` — used on paths that never render content, to avoid loading large blobs. */
+interface SectionMetaRow {
+  key: string;
+  service: string;
+  service_kind: string;
+  position: number;
+  content_hash: string;
+  tokens: number;
+}
+
 function sessionRowToSession(row: SessionRow): Session {
   return {
     id: row.id,
@@ -90,6 +100,18 @@ function sectionRowToSection(row: SectionRow): Section {
   };
 }
 
+/** Builds a `Section` without `content` (or `role`/`metadata`, not needed by diffing/compilation). */
+function sectionMetaRowToSection(row: SectionMetaRow): Section {
+  return {
+    key: row.key,
+    service: row.service,
+    serviceKind: row.service_kind as ServiceKind,
+    position: row.position,
+    contentHash: row.content_hash,
+    tokens: row.tokens,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -124,8 +146,6 @@ export function ensureStubSession(db: Db, sessionId: string, timestamp: string):
 }
 
 export function upsertSegment(db: Db, segment: SegmentWithSections): void {
-  ensureStubSession(db, segment.sessionId, segment.timestamp);
-
   const upsertSegmentStmt = db.prepare(
     `INSERT INTO segments (id, session_id, idx, label, kind, model, timestamp, metadata)
      VALUES (@id, @session_id, @idx, @label, @kind, @model, @timestamp, @metadata)
@@ -145,6 +165,10 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
   );
 
   const tx = db.transaction((seg: SegmentWithSections) => {
+    // Inside the transaction: if anything below throws (e.g. a constraint violation),
+    // the stub-session insert rolls back too, instead of leaving a phantom empty session
+    // behind for a segment that was ultimately rejected.
+    ensureStubSession(db, seg.sessionId, seg.timestamp);
     upsertSegmentStmt.run({
       id: seg.id,
       session_id: seg.sessionId,
@@ -162,10 +186,15 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
         typeof section.tokens === 'number' && Number.isFinite(section.tokens) && section.tokens >= 0
           ? Math.trunc(section.tokens)
           : estimateTokens(content ?? '');
+      // Content, when present, is the source of truth for its hash — recompute server-side
+      // rather than trusting a client-supplied hash that could be stale or forged. A client
+      // hash is only honored when content itself was omitted (a hash-only reference).
       const contentHash =
-        typeof section.contentHash === 'string' && section.contentHash.length > 0
-          ? section.contentHash
-          : fnv1a64(content ?? '');
+        content !== null
+          ? fnv1a64(content)
+          : typeof section.contentHash === 'string' && section.contentHash.length > 0
+            ? section.contentHash
+            : fnv1a64('');
       insertSectionStmt.run({
         segment_id: seg.id,
         key: section.key,
@@ -183,9 +212,14 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
   tx(segment);
 }
 
-export function endSession(db: Db, sessionId: string, endedAt: string): void {
-  ensureStubSession(db, sessionId, endedAt);
-  db.prepare('UPDATE sessions SET ended_at = ? WHERE id = ?').run(endedAt, sessionId);
+/**
+ * Ends an existing session. Unlike segment.recorded, this never fabricates a stub session:
+ * an unknown sessionId is a no-op, returning false so callers can reject the event instead
+ * of silently creating (or resurrecting a just-deleted) session from an end event alone.
+ */
+export function endSession(db: Db, sessionId: string, endedAt: string): boolean {
+  const result = db.prepare('UPDATE sessions SET ended_at = ? WHERE id = ?').run(endedAt, sessionId);
+  return result.changes > 0;
 }
 
 export function deleteSession(db: Db, id: string): boolean {
@@ -197,54 +231,104 @@ export function deleteSession(db: Db, id: string): boolean {
 // Reads
 // ---------------------------------------------------------------------------
 
-function loadSegmentsWithSections(db: Db, sessionId: string): TraceSourceSegment[] {
+/**
+ * Loads every segment's sections *without content* — safe for paths that never render
+ * section text (list/summary aggregates, delta counts, trace compilation), since content
+ * can be arbitrarily large and multiplies out across every segment in a session.
+ */
+function loadSegmentsWithSectionMeta(db: Db, sessionId: string): TraceSourceSegment[] {
   const segRows = db
     .prepare('SELECT * FROM segments WHERE session_id = ? ORDER BY idx ASC')
     .all(sessionId) as SegmentRow[];
-  const sectionStmt = db.prepare('SELECT * FROM sections WHERE segment_id = ? ORDER BY position ASC');
+  const sectionStmt = db.prepare(
+    'SELECT key, service, service_kind, position, content_hash, tokens FROM sections WHERE segment_id = ? ORDER BY position ASC'
+  );
   return segRows.map((row) => ({
     ...segmentRowToSegment(row),
-    sections: (sectionStmt.all(row.id) as SectionRow[]).map(sectionRowToSection),
+    sections: (sectionStmt.all(row.id) as SectionMetaRow[]).map(sectionMetaRowToSection),
   }));
 }
 
-function summarizeSession(row: SessionRow, segments: TraceSourceSegment[]): SessionSummary {
+/** Loads a single segment's sections *with* content — for the one endpoint that renders it. */
+function loadSingleSegmentWithSections(db: Db, row: SegmentRow): TraceSourceSegment {
+  const sectionRows = db
+    .prepare('SELECT * FROM sections WHERE segment_id = ? ORDER BY position ASC')
+    .all(row.id) as SectionRow[];
+  return { ...segmentRowToSegment(row), sections: sectionRows.map(sectionRowToSection) };
+}
+
+/**
+ * Builds a session summary entirely from SQL aggregates (counts, sums, distinct services,
+ * max timestamp) — never selects the `content` column, so summary/list paths don't pay for
+ * every section's text just to report counts and token totals.
+ */
+function buildSessionSummary(db: Db, row: SessionRow): SessionSummary {
   const session = sessionRowToSession(row);
-  const sorted = [...segments].sort((a, b) => a.index - b.index);
 
-  let sectionCount = 0;
-  let peakTokens = 0;
-  const servicesSet = new Set<string>();
-  let lastActivityAt = session.startedAt;
-  if (session.endedAt && session.endedAt > lastActivityAt) lastActivityAt = session.endedAt;
+  const counts = db
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM segments WHERE session_id = ?) AS segment_count,
+         (SELECT COUNT(*) FROM sections sec JOIN segments seg ON seg.id = sec.segment_id WHERE seg.session_id = ?) AS section_count`
+    )
+    .get(row.id, row.id) as { segment_count: number; section_count: number };
 
-  for (const seg of sorted) {
-    sectionCount += seg.sections.length;
-    const segTokens = seg.sections.reduce((sum, s) => sum + s.tokens, 0);
-    if (segTokens > peakTokens) peakTokens = segTokens;
-    for (const s of seg.sections) servicesSet.add(s.service);
-    if (seg.timestamp > lastActivityAt) lastActivityAt = seg.timestamp;
-  }
+  const latest = db
+    .prepare(
+      `SELECT COALESCE(SUM(sec.tokens), 0) AS total
+       FROM segments seg
+       LEFT JOIN sections sec ON sec.segment_id = seg.id
+       WHERE seg.session_id = ?
+         AND seg.idx = (SELECT MAX(idx) FROM segments WHERE session_id = ?)`
+    )
+    .get(row.id, row.id) as { total: number | null };
 
-  const last = sorted[sorted.length - 1];
-  const totalTokens = last ? last.sections.reduce((sum, s) => sum + s.tokens, 0) : 0;
+  const peak = db
+    .prepare(
+      `SELECT MAX(seg_tokens) AS peak FROM (
+         SELECT COALESCE(SUM(sec.tokens), 0) AS seg_tokens
+         FROM segments seg
+         LEFT JOIN sections sec ON sec.segment_id = seg.id
+         WHERE seg.session_id = ?
+         GROUP BY seg.id
+       )`
+    )
+    .get(row.id) as { peak: number | null };
+
+  const serviceRows = db
+    .prepare(
+      `SELECT DISTINCT sec.service AS service
+       FROM sections sec JOIN segments seg ON seg.id = sec.segment_id
+       WHERE seg.session_id = ?
+       ORDER BY sec.service ASC`
+    )
+    .all(row.id) as Array<{ service: string }>;
+
+  const lastActivity = db
+    .prepare(
+      `SELECT MAX(ts) AS last FROM (
+         SELECT timestamp AS ts FROM segments WHERE session_id = ?
+         UNION ALL SELECT started_at AS ts FROM sessions WHERE id = ?
+         UNION ALL SELECT ended_at AS ts FROM sessions WHERE id = ? AND ended_at IS NOT NULL
+       )`
+    )
+    .get(row.id, row.id, row.id) as { last: string | null };
 
   return {
     ...session,
-    segmentCount: sorted.length,
-    sectionCount,
-    totalTokens,
-    peakTokens,
-    services: [...servicesSet].sort(),
-    lastActivityAt,
+    segmentCount: counts.segment_count,
+    sectionCount: counts.section_count,
+    totalTokens: latest.total ?? 0,
+    peakTokens: peak.peak ?? 0,
+    services: serviceRows.map((r) => r.service),
+    lastActivityAt: lastActivity.last ?? session.startedAt,
   };
 }
 
 export function getSessionSummary(db: Db, id: string): SessionSummary | undefined {
   const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
   if (!row) return undefined;
-  const segments = loadSegmentsWithSections(db, id);
-  return summarizeSession(row, segments);
+  return buildSessionSummary(db, row);
 }
 
 export function getStats(db: Db): Stats {
@@ -281,7 +365,7 @@ export interface ListSessionsOptions {
 
 export function listSessions(db: Db, opts: ListSessionsOptions): { sessions: SessionSummary[]; total: number } {
   const q = opts.q?.trim();
-  let idRows: Array<{ id: string }>;
+  let rows: SessionRow[];
   let total: number;
 
   if (q) {
@@ -291,23 +375,20 @@ export function listSessions(db: Db, opts: ListSessionsOptions): { sessions: Ses
         .prepare(`SELECT COUNT(*) AS c FROM sessions WHERE lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?`)
         .get(like, like) as { c: number }
     ).c;
-    idRows = db
+    rows = db
       .prepare(
-        `SELECT id FROM sessions WHERE lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?
+        `SELECT * FROM sessions WHERE lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?
          ORDER BY started_at DESC LIMIT ? OFFSET ?`
       )
-      .all(like, like, opts.limit, opts.offset) as Array<{ id: string }>;
+      .all(like, like, opts.limit, opts.offset) as SessionRow[];
   } else {
     total = (db.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c;
-    idRows = db
-      .prepare('SELECT id FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?')
-      .all(opts.limit, opts.offset) as Array<{ id: string }>;
+    rows = db
+      .prepare('SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?')
+      .all(opts.limit, opts.offset) as SessionRow[];
   }
 
-  const sessions = idRows
-    .map((row) => getSessionSummary(db, row.id))
-    .filter((s): s is SessionSummary => s !== undefined);
-
+  const sessions = rows.map((row) => buildSessionSummary(db, row));
   return { sessions, total };
 }
 
@@ -315,8 +396,9 @@ export function getSessionDetail(db: Db, id: string): SessionDetail | undefined 
   const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
   if (!row) return undefined;
 
-  const segments = loadSegmentsWithSections(db, id);
-  const summary = summarizeSession(row, segments);
+  const summary = buildSessionSummary(db, row);
+  // Delta counts only need keys/hashes/tokens to diff consecutive segments, not content.
+  const segments = loadSegmentsWithSectionMeta(db, id);
   const sorted = [...segments].sort((a, b) => a.index - b.index);
 
   const segmentSummaries: SegmentSummary[] = [];
@@ -343,7 +425,9 @@ export function getSessionDetail(db: Db, id: string): SessionDetail | undefined 
 export function getSessionTrace(db: Db, id: string): CompiledTrace | undefined {
   const summary = getSessionSummary(db, id);
   if (!summary) return undefined;
-  const segments = loadSegmentsWithSections(db, id);
+  // The compiled trace never surfaces section content (ops/spans/services are all
+  // key/token/hash based), so compile from the lightweight, content-free load.
+  const segments = loadSegmentsWithSectionMeta(db, id);
   return compileTrace(summary, segments);
 }
 
@@ -351,12 +435,19 @@ export function getSegmentDetail(db: Db, sessionId: string, index: number): Segm
   const sessionExists = db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(sessionId);
   if (!sessionExists) return undefined;
 
-  const sorted = loadSegmentsWithSections(db, sessionId).sort((a, b) => a.index - b.index);
-  const segIdx = sorted.findIndex((s) => s.index === index);
-  if (segIdx === -1) return undefined;
+  const segRow = db.prepare('SELECT * FROM segments WHERE session_id = ? AND idx = ?').get(sessionId, index) as
+    | SegmentRow
+    | undefined;
+  if (!segRow) return undefined;
 
-  const seg = sorted[segIdx]!;
-  const previous = segIdx > 0 ? sorted[segIdx - 1] : undefined;
+  // Only the current + immediately previous segment ever need full content here — load
+  // just those two rather than every segment in the session.
+  const seg = loadSingleSegmentWithSections(db, segRow);
+  const prevRow = db
+    .prepare('SELECT * FROM segments WHERE session_id = ? AND idx < ? ORDER BY idx DESC LIMIT 1')
+    .get(sessionId, index) as SegmentRow | undefined;
+  const previous = prevRow ? loadSingleSegmentWithSections(db, prevRow) : undefined;
+
   const diff = diffSections(seg.sections, previous?.sections);
 
   const stateByKey = new Map<string, SectionState>();

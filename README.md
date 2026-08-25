@@ -25,6 +25,15 @@ npm run dev:web        # web on :5173, /api proxied to :4720
 npm run seed           # demo data against the local DB
 ```
 
+## Server configuration
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `CT_PORT` | `4720` | Server listen port |
+| `CT_DB` | `./data/context-trace.db` | SQLite database path (`/data/context-trace.db` in Docker) |
+| `CT_API_KEY` | unset | When set, **writes** (`POST /v1/ingest`, `DELETE /v1/sessions/:id`) require the `x-api-key` header. Reads stay open so the dashboard keeps working; treat read privacy as a network concern (the compose file binds the raw API to loopback only). |
+| `CT_CORS_ORIGIN` | `*` | CORS origin allowed for `POST /v1/ingest` only — read endpoints never emit CORS headers. |
+
 ## Capturing context
 
 ```ts

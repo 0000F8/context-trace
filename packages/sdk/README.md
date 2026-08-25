@@ -54,13 +54,14 @@ await ct.flush();      // drain queue (also on timer); ct.shutdown() = flush + s
 
 - `ct.startSession(options)` — starts a new session and immediately enqueues `session.started`. Returns a `SessionHandle`.
   - `options: { id?, name, agent?, metadata? }` — `id` is generated (ULID-like) if omitted.
-- `ct.session(id)` — re-binds to an already-started (or not-yet-seen) session by id **without** emitting `session.started`. For stateless hook contexts that only have a session id to correlate against (e.g. a webhook handler in a different process than the one that called `startSession`).
+- `ct.session(id)` — re-binds to an already-started (or not-yet-seen) session by id **without** emitting `session.started`. For stateless hook contexts that only have a session id to correlate against (e.g. a webhook handler that doesn't hold a `SessionHandle` in memory across invocations). The client caches one handle per session id, so every `startSession`/`session` call for the same id **within one client instance** returns the same underlying handle and shares its segment auto-counter — calling `ct.session(id)` repeatedly and then `segment()` with no explicit index still produces correctly incrementing indexes (0, 1, 2, ...) instead of every call landing on index 0.
 - `session.segment(options?)` — starts building a segment (one full context snapshot). Returns a `SegmentBuilder`.
   - `options: { id?, index?, label?, kind?, model?, timestamp?, metadata? }` — `kind` defaults to `'llm_call'`. `index` defaults to the session's internal 0-based auto-counter; passing an explicit `index` **wins** over the counter and advances it so later auto-assigned segments don't collide.
+  - The auto-counter is per session **handle**, which is now cached per id within one client instance (see `ct.session(id)` above) — but it is *not* shared across processes. If your hooks run in more than one process (e.g. a worker pool) or you create more than one client, pass an explicit `index` yourself (e.g. the framework's own step/turn number) so segments from different processes don't collide.
 - `segment.section(input)` — enqueues one contributing section. Chainable. Safe to call repeatedly from interleaved async callbacks.
   - `input: { key, service, serviceKind, role?, content?, tokens?, metadata? }` — `contentHash` is computed from `content ?? ''` immediately. `tokens` defaults to `estimateTokens(content ?? '')` when omitted.
   - Section `position` is **not** set here — it's assigned at `record()` time from call order (arrival order), so it's stable even under interleaved async calls.
-- `segment.record()` — finalizes the segment (assigns positions, computes the snapshot) and enqueues `segment.recorded`. **Idempotent**: a second call on the same builder is a no-op that reports a warning via `onError` instead of throwing.
+- `segment.record()` — finalizes the segment (assigns positions, computes the snapshot) and enqueues `segment.recorded`. **Idempotent**: a second call on the same builder is a no-op that reports a warning via `onError` instead of throwing. If two `section()` calls used the same `key`, the last one wins (its content replaces the earlier one in the same ordinal slot) and a warning is reported via `onError` — the server rejects a segment snapshot outright if it contains a duplicate key, so the SDK resolves it client-side first.
 - `session.end(endedAt?)` — enqueues `session.ended`.
 - `ct.flush()` — `Promise<void>`. Drains the queue, sending batches of up to `maxBatch` events. Concurrent calls share one in-flight drain. Never rejects — network failures are retried and eventually dropped internally (see below).
 - `ct.shutdown()` — `Promise<void>`. Stops the background timer, then flushes.
@@ -71,7 +72,9 @@ Only `flush()` and `shutdown()` return promises. Everything else (`startSession`
 
 - **Batching**: events are sent in arrival order, split into chunks of `maxBatch`.
 - **Retry**: network errors, `408`, `429`, and `5xx` responses are retried with exponential backoff (200ms, 400ms — 3 attempts total), then dropped and reported via `onError`. Other `4xx` responses (e.g. `400`, `401`, `404`) are treated as permanent — they're reported via `onError` and the batch is dropped immediately, without burning retries on a request that can't succeed. A dropped batch is never retried again on a later `flush()`.
+- **Partial rejection**: a `200` response can still partially reject a batch (`{ accepted, rejected: [{ index, reason }] }` — e.g. one malformed event mixed in with good ones). Those drops are never silent: the SDK reports one summarized `Error` via `onError` listing each rejected event's type and reason. A non-JSON or unparsable response body is tolerated (no `onError` call, since there's nothing meaningful to report).
 - **Backpressure**: the queue is bounded by `maxQueue`. On overflow the oldest queued event is dropped (not the newest) and `onError` fires, so recent activity is preserved over stale activity.
+- **Option validation**: `maxBatch` and `maxQueue` are floored to whole numbers and must be `>= 1`; `flushIntervalMs` must be `>= 0`. A `NaN`, non-finite, or out-of-range value (including `maxBatch: 0`, which would otherwise make `flush()` loop forever splicing zero-length batches) is ignored and the default is used instead.
 - **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`.
 - **`enabled: false`**: turns the client into a complete no-op — useful for disabling tracing in tests or specific environments without changing call sites.
 
@@ -88,6 +91,16 @@ equivalents in other agent frameworks), where a segment builder is opened in
 one hook and closed in a later, possibly-interleaved one. Below is a
 generic, framework-independent adapter shape — no dependency on LangChain
 itself, just the shape of its callback handler interface.
+
+Because `ct.session(id)` caches its handle per id, re-binding on every hook
+invocation (rather than threading a `SessionHandle` through closures) is
+safe **within one process**: plain `session.segment({ kind, model })` with
+no explicit `index` still produces correctly incrementing indexes, since
+the cached handle's auto-counter is shared across calls. That single-process
+guarantee doesn't extend across a worker pool or multiple client instances,
+though — the counter lives in that one client's memory. If your hooks can
+run in more than one process, pass an explicit `index` yourself (e.g. the
+framework's own step/turn number) instead of relying on the auto-counter.
 
 ```ts
 import { createClient, type SegmentBuilder, type SessionHandle } from '@context-trace/sdk';
@@ -119,8 +132,13 @@ class ContextTraceCallbackHandler {
     model: string;
     prompts: Array<{ role: string; content: string }>;
   }): Promise<void> {
-    // Re-bind rather than trust local state, so this works even if this
-    // hook runs in a different process/worker than handleChainStart did.
+    // ct.session(id) is cached per id, so re-binding here even without the
+    // local `this.sessions` lookup would still share one segment
+    // auto-counter with handleChainStart's handle — safe within this
+    // process. No explicit `index` needed here. If handleLLMStart could run
+    // in a *different* process/worker than handleChainStart, pass an
+    // explicit `index` (e.g. run.stepNumber) instead, since the
+    // auto-counter doesn't cross process boundaries.
     const session = this.sessions.get(run.parentRunId) ?? ct.session(run.parentRunId);
     const segment = session.segment({ id: run.runId, kind: 'llm_call', model: run.model });
 

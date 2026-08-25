@@ -1,9 +1,13 @@
+import { fnv1a64 } from '@context-trace/types';
 import type { CompiledTrace } from '@context-trace/types';
 
 /**
- * Service palette (data — the only saturated colors on screen). Assigned to
- * services by order of first appearance in a session, deterministic, cycling
- * after 8. See .omc/autopilot/design-brief.md.
+ * Service palette (data — the only saturated colors on screen). A service's
+ * slot is `fnv1a64(name) mod 8` (see colorForService below), not order of
+ * appearance — that keeps a service's color identical across every view
+ * (session table vs. trace view) and every session, without needing shared
+ * ordering state. Rare collisions between two service names are acceptable.
+ * See .omc/autopilot/design-brief.md.
  */
 export const SERVICE_PALETTE: ReadonlyArray<{ name: string; base: string }> = [
   { name: 'teal', base: '#0F6B62' },
@@ -51,15 +55,30 @@ export function deriveServiceOrder(trace: Pick<CompiledTrace, 'segments'>): stri
 }
 
 /**
- * Assigns each service a stable palette slot by first-appearance order,
- * cycling after 8 services. Safe against duplicate entries in the input.
+ * Deterministic palette slot for a service name: fnv1a64(name) mod palette
+ * length. Independent of when or where the name is first seen, so the same
+ * service always lands on the same slot in every view and every session.
+ */
+export function paletteSlotForService(serviceName: string): number {
+  const hash = BigInt(`0x${fnv1a64(serviceName)}`);
+  return Number(hash % BigInt(SERVICE_PALETTE.length));
+}
+
+export function colorForService(serviceName: string): string {
+  return SERVICE_PALETTE[paletteSlotForService(serviceName)]!.base;
+}
+
+/**
+ * Maps each service name to its deterministic color (see colorForService).
+ * `servicesInOrder` only controls Map insertion/iteration order (used by
+ * callers for legend/stacking order) — it has no effect on which color a
+ * service gets. Safe against duplicate entries in the input.
  */
 export function assignServiceColors(servicesInOrder: string[]): Map<string, string> {
   const map = new Map<string, string>();
   for (const service of servicesInOrder) {
     if (!map.has(service)) {
-      const slot = SERVICE_PALETTE[map.size % SERVICE_PALETTE.length]!;
-      map.set(service, slot.base);
+      map.set(service, colorForService(service));
     }
   }
   return map;
