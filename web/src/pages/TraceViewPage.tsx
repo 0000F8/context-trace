@@ -28,6 +28,8 @@ export function TraceViewPage() {
   const [segmentDetails, setSegmentDetails] = useState<Map<number, SegmentDetail>>(new Map());
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [gutterMinimized, setGutterMinimized] = useState(false);
+  const gutterWidth = gutterMinimized ? 24 : ROW_LABEL_WIDTH;
 
   const trace = traceState.status === 'ready' ? traceState.data : null;
 
@@ -128,12 +130,22 @@ export function TraceViewPage() {
         onHoverService={setHoveredService}
       />
       <div className="trace-view__center">
-        <p className="trace-view__zone-title">Composition timeline</p>
+        <div className="trace-view__zone-head">
+          <p className="trace-view__zone-title">Composition timeline</p>
+          <button
+            type="button"
+            className="gutter-toggle"
+            onClick={() => setGutterMinimized((v) => !v)}
+            aria-pressed={gutterMinimized}
+          >
+            {gutterMinimized ? 'Show labels' : 'Hide labels'}
+          </button>
+        </div>
         <div className="trace-view__scroll">
           {selectedColumn >= 0 && (
             <div
               className="core-sample-rule"
-              style={{ left: ROW_LABEL_WIDTH + selectedColumn * COLUMN_WIDTH, width: COLUMN_WIDTH }}
+              style={{ left: gutterWidth + selectedColumn * COLUMN_WIDTH, width: COLUMN_WIDTH }}
             />
           )}
           <CompositionTimeline
@@ -142,6 +154,7 @@ export function TraceViewPage() {
             maxTokens={maxTokens}
             selectedIndex={selectedIndex}
             hoveredService={hoveredService}
+            gutterWidth={gutterWidth}
             onSelect={setSelectedIndex}
           />
           <p className="trace-view__zone-title">Strata grid (section lanes)</p>
@@ -151,6 +164,7 @@ export function TraceViewPage() {
             cellStates={cellStates}
             colorMap={colorMap}
             hoveredService={hoveredService}
+            gutterWidth={gutterWidth}
             onSelectSegment={setSelectedIndex}
             onSelectSection={setDrawerKey}
           />

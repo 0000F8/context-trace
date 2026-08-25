@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { TraceSegment } from '@context-trace/types';
-import { COLUMN_WIDTH, ROW_LABEL_WIDTH, TIMELINE_HEIGHT } from '../lib/layout';
+import { COLUMN_WIDTH, TIMELINE_HEIGHT } from '../lib/layout';
 import { formatTokens } from '../lib/format';
 import type { CSSVarStyle } from '../lib/css-vars';
 import './CompositionTimeline.css';
@@ -11,6 +11,8 @@ interface CompositionTimelineProps {
   maxTokens: number;
   selectedIndex: number | null;
   hoveredService: string | null;
+  /** Width of the sticky left gutter; below 60px the tick labels are hidden. */
+  gutterWidth: number;
   onSelect: (index: number) => void;
 }
 
@@ -31,14 +33,15 @@ function niceTicks(max: number, target = 4): number[] {
   return ticks;
 }
 
-export function CompositionTimeline({ segments, colorMap, maxTokens, selectedIndex, hoveredService, onSelect }: CompositionTimelineProps) {
+export function CompositionTimeline({ segments, colorMap, maxTokens, selectedIndex, hoveredService, gutterWidth, onSelect }: CompositionTimelineProps) {
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
-  const width = ROW_LABEL_WIDTH + segments.length * COLUMN_WIDTH;
+  const width = gutterWidth + segments.length * COLUMN_WIDTH;
+  const showTickLabels = gutterWidth >= 60;
   const barAreaHeight = TIMELINE_HEIGHT - 20;
   const serviceOrderList = [...colorMap.keys()];
 
   const points = segments.map((seg, i) => {
-    const x = ROW_LABEL_WIDTH + i * COLUMN_WIDTH + COLUMN_WIDTH / 2;
+    const x = gutterWidth + i * COLUMN_WIDTH + COLUMN_WIDTH / 2;
     const y = maxTokens > 0 ? barAreaHeight - (seg.totalTokens / maxTokens) * barAreaHeight : barAreaHeight;
     return { x, y };
   });
@@ -48,20 +51,25 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
 
   return (
     <div className="composition-timeline">
-      {/* Sticky ordinate: stays pinned to the left edge while the chart pans. */}
+      {/* Sticky ordinate: stays pinned to the left edge while the chart pans.
+          The backdrop is opaque so bars never show through under the labels. */}
       <div className="timeline__axis-overlay" aria-hidden>
-        <span className="timeline__axis-sticky-label" style={{ top: 4 }}>
-          tokens
-        </span>
-        {ticks.map((v) => (
-          <span
-            key={v}
-            className="timeline__axis-sticky-label"
-            style={{ top: 4 + barAreaHeight - (v / maxTokens) * barAreaHeight - 7 }}
-          >
-            {formatTokens(v)}
+        <div className="chart-gutter-backdrop" style={{ width: gutterWidth, height: TIMELINE_HEIGHT + 4 }} />
+        {showTickLabels && (
+          <span className="timeline__axis-sticky-label" style={{ top: 4 }}>
+            tokens
           </span>
-        ))}
+        )}
+        {showTickLabels &&
+          ticks.map((v) => (
+            <span
+              key={v}
+              className="timeline__axis-sticky-label"
+              style={{ top: 4 + barAreaHeight - (v / maxTokens) * barAreaHeight - 7 }}
+            >
+              {formatTokens(v)}
+            </span>
+          ))}
       </div>
       <svg width={width} height={TIMELINE_HEIGHT} role="img" aria-label="Composition timeline">
         {ticks.map((v) => {
@@ -70,7 +78,7 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
         })}
         <line x1={0} y1={barAreaHeight} x2={width} y2={barAreaHeight} className="timeline__baseline" />
         {segments.map((seg, i) => {
-          const x = ROW_LABEL_WIDTH + i * COLUMN_WIDTH;
+          const x = gutterWidth + i * COLUMN_WIDTH;
           let cursorY = barAreaHeight;
           const orderedServices = [...seg.services].sort(
             (a, b) => serviceOrderList.indexOf(a.name) - serviceOrderList.indexOf(b.name),

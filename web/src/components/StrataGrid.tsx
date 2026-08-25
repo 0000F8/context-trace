@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { TraceSegment } from '@context-trace/types';
 import type { CellState, StrataGroup } from '../lib/strata';
-import { COLUMN_WIDTH, ROW_HEIGHT, ROW_LABEL_WIDTH } from '../lib/layout';
+import { COLUMN_WIDTH, ROW_HEIGHT } from '../lib/layout';
 import { softColorFor } from '../lib/colors';
 import { truncateMiddle } from '../lib/format';
 import './StrataGrid.css';
@@ -12,17 +12,20 @@ interface StrataGridProps {
   cellStates: Map<string, Map<number, CellState>>;
   colorMap: Map<string, string>;
   hoveredService: string | null;
+  /** Width of the sticky left gutter; below 60px labels collapse to color ticks. */
+  gutterWidth: number;
   onSelectSegment: (index: number) => void;
   onSelectSection: (key: string) => void;
 }
 
 const CELL_PAD = 3;
 
-export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredService, onSelectSegment, onSelectSection }: StrataGridProps) {
+export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredService, gutterWidth, onSelectSegment, onSelectSection }: StrataGridProps) {
   const [tooltip, setTooltip] = useState<{ x: number; y: number; label: string } | null>(null);
   const rows = groups.flatMap((g) => g.rows.map((row) => ({ span: row.span, service: g.service })));
-  const width = ROW_LABEL_WIDTH + segments.length * COLUMN_WIDTH;
+  const width = gutterWidth + segments.length * COLUMN_WIDTH;
   const height = rows.length * ROW_HEIGHT + 24;
+  const showLabelText = gutterWidth >= 60;
 
   if (rows.length === 0) {
     return <div className="strata-grid strata-grid--empty">No sections recorded for this session.</div>;
@@ -30,8 +33,10 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
 
   return (
     <div className="strata-grid">
-      {/* Sticky row labels: stay pinned while the cell grid pans horizontally. */}
+      {/* Sticky row labels: stay pinned while the cell grid pans horizontally.
+          The backdrop is opaque so cells never show through under the gutter. */}
       <div className="strata-grid__label-overlay" aria-hidden>
+        <div className="chart-gutter-backdrop" style={{ width: gutterWidth, height: rows.length * ROW_HEIGHT }} />
         {rows.map((row, r) => {
           const color = colorMap.get(row.service) ?? '#0F6B62';
           const dimmedRow = hoveredService != null && hoveredService !== row.service;
@@ -39,10 +44,10 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
             <div
               key={row.span.key}
               className={`strata-grid__sticky-label${dimmedRow ? ' is-dimmed' : ''}`}
-              style={{ top: r * ROW_HEIGHT, width: ROW_LABEL_WIDTH - 10, height: ROW_HEIGHT - 2, borderLeftColor: color }}
+              style={{ top: r * ROW_HEIGHT, width: gutterWidth - 10, height: ROW_HEIGHT - 2, borderLeftColor: color }}
               title={row.span.key}
             >
-              {truncateMiddle(row.span.key, 22)}
+              {showLabelText ? truncateMiddle(row.span.key, 22) : ''}
             </div>
           );
         })}
@@ -57,7 +62,7 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
               {segments.map((seg, c) => {
                 const state = cellStates.get(row.span.key)?.get(seg.index);
                 if (!state) return null;
-                const x = ROW_LABEL_WIDTH + c * COLUMN_WIDTH + CELL_PAD;
+                const x = gutterWidth + c * COLUMN_WIDTH + CELL_PAD;
                 const w = COLUMN_WIDTH - CELL_PAD * 2;
                 const cellH = ROW_HEIGHT - 6;
                 const cellY = y + 3;
@@ -104,7 +109,7 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
         {segments.map((seg, c) => (
           <text
             key={seg.id}
-            x={ROW_LABEL_WIDTH + c * COLUMN_WIDTH + COLUMN_WIDTH / 2}
+            x={gutterWidth + c * COLUMN_WIDTH + COLUMN_WIDTH / 2}
             y={rows.length * ROW_HEIGHT + 16}
             className="strata-grid__axis-label"
             textAnchor="middle"

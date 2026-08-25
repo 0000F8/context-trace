@@ -20,6 +20,8 @@
   color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 6px;
   pointer-events: auto;
   transition: opacity 150ms ease;
 }

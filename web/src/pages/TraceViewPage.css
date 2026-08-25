@@ -40,6 +40,41 @@
   margin-top: 0;
 }
 
+.trace-view__zone-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trace-view__zone-head .trace-view__zone-title {
+  margin-top: 0;
+}
+
+.gutter-toggle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--focus);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.gutter-toggle:hover {
+  border-color: var(--focus);
+}
+
+/* Opaque plate behind sticky gutter labels so chart content never shows
+   through while panning. Shared by the timeline and the strata grid. */
+.chart-gutter-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: var(--bg);
+}
+
 .trace-view--loading,
 .trace-view--error,
 .trace-view--empty {
