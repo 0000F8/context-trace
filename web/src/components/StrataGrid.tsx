@@ -14,18 +14,38 @@ interface StrataGridProps {
   hoveredService: string | null;
   /** Width of the sticky left gutter; below 60px labels collapse to color ticks. */
   gutterWidth: number;
+  /** Drag-resize callback; null resets to auto-fit. Handle hidden when absent. */
+  onResizeGutter?: (width: number | null) => void;
   onSelectSegment: (index: number) => void;
   onSelectSection: (key: string) => void;
 }
 
 const CELL_PAD = 3;
 
-export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredService, gutterWidth, onSelectSegment, onSelectSection }: StrataGridProps) {
+export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredService, gutterWidth, onResizeGutter, onSelectSegment, onSelectSection }: StrataGridProps) {
   const [tooltip, setTooltip] = useState<{ x: number; y: number; label: string } | null>(null);
   const rows = groups.flatMap((g) => g.rows.map((row) => ({ span: row.span, service: g.service })));
   const width = gutterWidth + segments.length * COLUMN_WIDTH;
   const height = rows.length * ROW_HEIGHT + 24;
   const showLabelText = gutterWidth >= 60;
+  // Char budget for middle-truncation at the current gutter width (mono ~7.2px/char).
+  const labelChars = Math.max(6, Math.floor((gutterWidth - 30) / 7.2));
+
+  const startGutterDrag = (e: React.PointerEvent) => {
+    if (!onResizeGutter) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = gutterWidth;
+    const move = (ev: PointerEvent) => {
+      onResizeGutter(Math.min(480, Math.max(120, startW + ev.clientX - startX)));
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
 
   if (rows.length === 0) {
     return <div className="strata-grid strata-grid--empty">No sections recorded for this session.</div>;
@@ -47,10 +67,19 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
               style={{ top: r * ROW_HEIGHT, width: gutterWidth - 10, height: ROW_HEIGHT - 2, borderLeftColor: color }}
               title={row.span.key}
             >
-              {showLabelText ? truncateMiddle(row.span.key, 22) : ''}
+              {showLabelText ? truncateMiddle(row.span.key, labelChars) : ''}
             </div>
           );
         })}
+        {showLabelText && onResizeGutter && (
+          <div
+            className="strata-grid__resize-handle"
+            style={{ left: gutterWidth - 4, height: rows.length * ROW_HEIGHT }}
+            title="Drag to resize labels; double-click to fit"
+            onPointerDown={startGutterDrag}
+            onDoubleClick={() => onResizeGutter(null)}
+          />
+        )}
       </div>
       <svg width={width} height={height} role="img" aria-label="Section lanes (strata grid)">
         {rows.map((row, r) => {

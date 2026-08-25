@@ -31,7 +31,11 @@ export function TraceViewPage() {
   const [gutterMinimized, setGutterMinimized] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
-  const gutterWidth = gutterMinimized ? 24 : ROW_LABEL_WIDTH;
+  // Manual gutter width (drag handle); null = auto-fit to the longest key.
+  const [gutterPref, setGutterPref] = useState<number | null>(() => {
+    const v = Number(localStorage.getItem('ct:gutterWidth'));
+    return Number.isFinite(v) && v >= 120 ? v : null;
+  });
 
   const trace = traceState.status === 'ready' ? traceState.data : null;
 
@@ -51,6 +55,21 @@ export function TraceViewPage() {
   const colorMap = useMemo(() => assignServiceColors(serviceOrder), [serviceOrder]);
   const cellStates = useMemo(() => (trace ? buildCellStates(trace) : new Map()), [trace]);
   const groups = useMemo(() => (trace ? groupSpansByService(trace.spans, serviceOrder) : []), [trace, serviceOrder]);
+
+  // Auto-fit the label gutter to the longest section key (IBM Plex Mono at
+  // 12px advances ~7.2px/char), clamped so huge keys can't eat the chart.
+  const autoGutter = useMemo(() => {
+    if (!trace || trace.spans.length === 0) return ROW_LABEL_WIDTH;
+    const longest = trace.spans.reduce((m, s) => Math.max(m, s.key.length), 0);
+    return Math.min(340, Math.max(140, Math.round(longest * 7.2) + 30));
+  }, [trace]);
+  const gutterWidth = gutterMinimized ? 24 : (gutterPref ?? autoGutter);
+
+  const resizeGutter = (w: number | null) => {
+    setGutterPref(w);
+    if (w == null) localStorage.removeItem('ct:gutterWidth');
+    else localStorage.setItem('ct:gutterWidth', String(w));
+  };
 
   useEffect(() => {
     if (!trace || selectedIndex == null) return;
@@ -194,6 +213,7 @@ export function TraceViewPage() {
             colorMap={colorMap}
             hoveredService={hoveredService}
             gutterWidth={gutterWidth}
+            onResizeGutter={resizeGutter}
             onSelectSegment={setSelectedIndex}
             onSelectSection={setDrawerKey}
           />
