@@ -30,6 +30,23 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
 
   return (
     <div className="strata-grid">
+      {/* Sticky row labels: stay pinned while the cell grid pans horizontally. */}
+      <div className="strata-grid__label-overlay" aria-hidden>
+        {rows.map((row, r) => {
+          const color = colorMap.get(row.service) ?? '#0F6B62';
+          const dimmedRow = hoveredService != null && hoveredService !== row.service;
+          return (
+            <div
+              key={row.span.key}
+              className={`strata-grid__sticky-label${dimmedRow ? ' is-dimmed' : ''}`}
+              style={{ top: r * ROW_HEIGHT, width: ROW_LABEL_WIDTH - 10, height: ROW_HEIGHT - 2, borderLeftColor: color }}
+              title={row.span.key}
+            >
+              {truncateMiddle(row.span.key, 22)}
+            </div>
+          );
+        })}
+      </div>
       <svg width={width} height={height} role="img" aria-label="Section lanes (strata grid)">
         {rows.map((row, r) => {
           const y = r * ROW_HEIGHT;
@@ -37,11 +54,6 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
           const dimmedRow = hoveredService != null && hoveredService !== row.service;
           return (
             <g key={row.span.key} className={dimmedRow ? 'is-dimmed' : ''}>
-              <rect x={0} y={y} width={4} height={ROW_HEIGHT - 2} fill={color} />
-              <text x={12} y={y + ROW_HEIGHT / 2 + 4} className="strata-grid__label">
-                <title>{row.span.key}</title>
-                {truncateMiddle(row.span.key, 22)}
-              </text>
               {segments.map((seg, c) => {
                 const state = cellStates.get(row.span.key)?.get(seg.index);
                 if (!state) return null;

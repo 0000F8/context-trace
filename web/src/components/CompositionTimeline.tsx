@@ -20,6 +20,17 @@ interface Tooltip {
   label: string;
 }
 
+/** Round-number axis ticks: 1/2/2.5/5 × 10^n steps, at most `target` ticks. */
+function niceTicks(max: number, target = 4): number[] {
+  if (max <= 0) return [];
+  const raw = max / target;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => max / s <= target) ?? mag * 10;
+  const ticks: number[] = [];
+  for (let v = step; v <= max; v += step) ticks.push(v);
+  return ticks;
+}
+
 export function CompositionTimeline({ segments, colorMap, maxTokens, selectedIndex, hoveredService, onSelect }: CompositionTimelineProps) {
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
   const width = ROW_LABEL_WIDTH + segments.length * COLUMN_WIDTH;
@@ -33,12 +44,31 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
   });
   const linePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' ');
 
+  const ticks = niceTicks(maxTokens);
+
   return (
     <div className="composition-timeline">
-      <svg width={width} height={TIMELINE_HEIGHT} role="img" aria-label="Composition timeline">
-        <text x={8} y={14} className="chart-axis-label">
+      {/* Sticky ordinate: stays pinned to the left edge while the chart pans. */}
+      <div className="timeline__axis-overlay" aria-hidden>
+        <span className="timeline__axis-sticky-label" style={{ top: 4 }}>
           tokens
-        </text>
+        </span>
+        {ticks.map((v) => (
+          <span
+            key={v}
+            className="timeline__axis-sticky-label"
+            style={{ top: 4 + barAreaHeight - (v / maxTokens) * barAreaHeight - 7 }}
+          >
+            {formatTokens(v)}
+          </span>
+        ))}
+      </div>
+      <svg width={width} height={TIMELINE_HEIGHT} role="img" aria-label="Composition timeline">
+        {ticks.map((v) => {
+          const y = barAreaHeight - (v / maxTokens) * barAreaHeight;
+          return <line key={v} x1={0} y1={y} x2={width} y2={y} className="timeline__gridline" />;
+        })}
+        <line x1={0} y1={barAreaHeight} x2={width} y2={barAreaHeight} className="timeline__baseline" />
         {segments.map((seg, i) => {
           const x = ROW_LABEL_WIDTH + i * COLUMN_WIDTH;
           let cursorY = barAreaHeight;

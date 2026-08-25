@@ -47,6 +47,13 @@
   padding: 32px 24px;
 }
 
+/* Narrower viewports: side panels yield width but the rail stays on the left. */
+@media (max-width: 1280px) {
+  .trace-view {
+    grid-template-columns: 200px minmax(0, 1fr) 320px;
+  }
+}
+
 @media (max-width: 900px) {
   .trace-view {
     grid-template-columns: 1fr;

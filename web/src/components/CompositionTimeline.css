@@ -1,12 +1,51 @@
 .composition-timeline {
   position: relative;
   padding: 4px 0 0;
+  /* span the full chart so the sticky axis can stay pinned across the whole pan */
+  width: max-content;
+  min-width: 100%;
 }
 
 .chart-axis-label {
   font-family: var(--font-mono);
   font-size: 11px;
   fill: var(--ink-2);
+}
+
+.timeline__gridline {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.timeline__axis-overlay {
+  position: sticky;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: visible;
+  z-index: 2;
+}
+
+.timeline__axis-sticky-label {
+  position: absolute;
+  left: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  background: var(--bg);
+  padding: 0 4px 0 0;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.timeline__baseline {
+  stroke: var(--ink-2);
+  stroke-width: 1;
+  opacity: 0.5;
+}
+
+.timeline__tick-label {
+  text-anchor: end;
 }
 
 .timeline__column {
