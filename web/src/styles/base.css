@@ -87,6 +87,7 @@ pre {
   padding: 14px 24px;
   display: flex;
   align-items: baseline;
+  justify-content: space-between;
   gap: 10px;
 }
 
@@ -96,6 +97,22 @@ pre {
   letter-spacing: -0.01em;
   color: var(--ink);
   text-decoration: none;
+}
+
+.theme-toggle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+
+.theme-toggle:hover {
+  color: var(--focus);
+  border-color: var(--focus);
 }
 
 .state {

@@ -1,8 +1,17 @@
+import { useState } from 'react';
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { SessionsPage } from './pages/SessionsPage';
 import { TraceViewPage } from './pages/TraceViewPage';
+import { applyTheme, initialTheme, type Theme } from './lib/theme';
 
 export function App() {
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    setTheme(next);
+  };
+
   return (
     <BrowserRouter>
       <div className="app-shell">
@@ -11,6 +20,9 @@ export function App() {
             <Link to="/" className="app-header__brand">
               context-trace
             </Link>
+            <button type="button" className="theme-toggle" onClick={toggleTheme}>
+              {theme === 'dark' ? 'Light theme' : 'Dark theme'}
+            </button>
           </div>
         </header>
         <Routes>

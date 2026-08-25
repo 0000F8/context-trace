@@ -16,12 +16,11 @@ describe('colorForService / paletteSlotForService', () => {
     expect(paletteSlotForService('memory')).toBe(paletteSlotForService('memory'));
   });
 
-  it('always returns a slot within the palette', () => {
-    const paletteColors = SERVICE_PALETTE.map((p) => p.base);
-    expect(paletteColors).toContain(colorForService('retrieval'));
+  it('always returns a slot within the palette, as a theme-aware var()', () => {
     const slot = paletteSlotForService('retrieval');
     expect(slot).toBeGreaterThanOrEqual(0);
     expect(slot).toBeLessThan(SERVICE_PALETTE.length);
+    expect(colorForService('retrieval')).toBe(`var(--service-${slot})`);
   });
 
   it('does not depend on first-appearance order', () => {

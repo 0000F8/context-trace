@@ -28,9 +28,11 @@ export function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-/** The `-soft` tint: same hue at ~14% alpha over surface, for carried/background states. */
-export function softColorFor(hex: string): string {
-  return hexToRgba(hex, 0.14);
+/** The `-soft` tint: same hue at low alpha over surface, for carried/background states. */
+export function softColorFor(color: string): string {
+  const varRef = color.match(/^var\((--service-[0-7])\)$/);
+  if (varRef) return `var(${varRef[1]}-soft)`;
+  return hexToRgba(color, 0.14);
 }
 
 /**
@@ -65,7 +67,9 @@ export function paletteSlotForService(serviceName: string): number {
 }
 
 export function colorForService(serviceName: string): string {
-  return SERVICE_PALETTE[paletteSlotForService(serviceName)]!.base;
+  // A var() reference rather than raw hex so the data palette follows the
+  // active theme (tokens.css defines light and dark values per slot).
+  return `var(--service-${paletteSlotForService(serviceName)})`;
 }
 
 /**

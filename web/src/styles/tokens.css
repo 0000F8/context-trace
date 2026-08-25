@@ -40,4 +40,42 @@
 
   --radius-max: 6px;
   --shadow-max: 0 1px 2px rgba(23, 36, 46, 0.06);
+
+  color-scheme: light;
+}
+
+/* Dark lab bench: same instrument, lights off. Chrome recedes further and the
+   data palette brightens a step so it carries on deep surfaces. */
+:root[data-theme='dark'] {
+  --bg: #10161b;
+  --surface: #171f26;
+  --ink: #e4ebef;
+  --ink-2: #8da0ac;
+  --line: #26313a;
+  --focus: #3aa392;
+
+  --service-0: #2e9c8f;
+  --service-1: #e08a4d;
+  --service-2: #6c8cd8;
+  --service-3: #ac85d6;
+  --service-4: #d66787;
+  --service-5: #8cac5a;
+  --service-6: #c29a4a;
+  --service-7: #74a8ba;
+
+  --service-0-soft: rgba(46, 156, 143, 0.2);
+  --service-1-soft: rgba(224, 138, 77, 0.2);
+  --service-2-soft: rgba(108, 140, 216, 0.2);
+  --service-3-soft: rgba(172, 133, 214, 0.2);
+  --service-4-soft: rgba(214, 103, 135, 0.2);
+  --service-5-soft: rgba(140, 172, 90, 0.2);
+  --service-6-soft: rgba(194, 154, 74, 0.2);
+  --service-7-soft: rgba(116, 168, 186, 0.2);
+
+  --madder-soft: rgba(214, 103, 135, 0.18);
+  --teal-soft: rgba(46, 156, 143, 0.18);
+
+  --shadow-max: 0 1px 2px rgba(0, 0, 0, 0.35);
+
+  color-scheme: dark;
 }
