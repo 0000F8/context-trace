@@ -14,6 +14,11 @@ docker compose run --rm seed      # load demo sessions
 open http://localhost:8080
 ```
 
+For a real multi-turn trace (a coding-agent session with growing history, file reads
+evicted over time, subagent reports, and a mid-session compaction cliff), run
+`npm run build && node examples/trace-real-session.mjs` — it captures the Claude Code
+session that built this repo, using the repo's own files as context payloads.
+
 ## Development
 
 ```sh
