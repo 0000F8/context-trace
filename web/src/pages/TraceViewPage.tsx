@@ -29,6 +29,8 @@ export function TraceViewPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [gutterMinimized, setGutterMinimized] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const gutterWidth = gutterMinimized ? 24 : ROW_LABEL_WIDTH;
 
   const trace = traceState.status === 'ready' ? traceState.data : null;
@@ -120,15 +122,42 @@ export function TraceViewPage() {
   const drawerSpan = drawerKey ? (trace.spans.find((s) => s.key === drawerKey) ?? null) : null;
 
   return (
-    <div className="trace-view">
-      <LeftRail
-        session={trace.session}
-        services={trace.services}
-        serviceOrder={serviceOrder}
-        colorMap={colorMap}
-        hoveredService={hoveredService}
-        onHoverService={setHoveredService}
-      />
+    <div
+      className={`trace-view${railCollapsed ? ' trace-view--rail-collapsed' : ''}${
+        inspectorCollapsed ? ' trace-view--inspector-collapsed' : ''
+      }`}
+    >
+      {railCollapsed ? (
+        <button
+          type="button"
+          className="side-strip side-strip--left"
+          onClick={() => setRailCollapsed(false)}
+          title="Show session panel"
+        >
+          <span aria-hidden>»</span>
+          <span className="side-strip__label">Session</span>
+        </button>
+      ) : (
+        <div className="side-panel side-panel--left">
+          <button
+            type="button"
+            className="side-collapse"
+            onClick={() => setRailCollapsed(true)}
+            title="Hide session panel"
+            aria-label="Hide session panel"
+          >
+            «
+          </button>
+          <LeftRail
+            session={trace.session}
+            services={trace.services}
+            serviceOrder={serviceOrder}
+            colorMap={colorMap}
+            hoveredService={hoveredService}
+            onHoverService={setHoveredService}
+          />
+        </div>
+      )}
       <div className="trace-view__center">
         <div className="trace-view__zone-head">
           <p className="trace-view__zone-title">Composition timeline</p>
@@ -170,17 +199,40 @@ export function TraceViewPage() {
           />
         </div>
       </div>
-      <Inspector
-        segment={selectedSegment}
-        previousSegment={selectedIndex != null ? findPreviousSegment(trace.segments, selectedIndex) : null}
-        detail={selectedDetail}
-        loading={detailLoading}
-        error={detailError}
-        colorMap={colorMap}
-        tab={inspectorTab}
-        onTabChange={setInspectorTab}
-        onOpenSection={setDrawerKey}
-      />
+      {inspectorCollapsed ? (
+        <button
+          type="button"
+          className="side-strip side-strip--right"
+          onClick={() => setInspectorCollapsed(false)}
+          title="Show inspector"
+        >
+          <span aria-hidden>«</span>
+          <span className="side-strip__label">Inspector</span>
+        </button>
+      ) : (
+        <div className="side-panel side-panel--right">
+          <button
+            type="button"
+            className="side-collapse"
+            onClick={() => setInspectorCollapsed(true)}
+            title="Hide inspector"
+            aria-label="Hide inspector"
+          >
+            »
+          </button>
+          <Inspector
+            segment={selectedSegment}
+            previousSegment={selectedIndex != null ? findPreviousSegment(trace.segments, selectedIndex) : null}
+            detail={selectedDetail}
+            loading={detailLoading}
+            error={detailError}
+            colorMap={colorMap}
+            tab={inspectorTab}
+            onTabChange={setInspectorTab}
+            onOpenSection={setDrawerKey}
+          />
+        </div>
+      )}
       {drawerKey && (
         <SectionDrawer
           sessionId={trace.session.id}

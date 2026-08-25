@@ -1,5 +1,10 @@
 .composition-timeline {
-  position: relative;
+  /* Vertically sticky: the context graph stays visible while scrolling down
+     through the strata grid. Opaque background so lanes vanish beneath it. */
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg);
   padding: 4px 0 0;
   /* span the full chart so the sticky axis can stay pinned across the whole pan */
   width: max-content;
