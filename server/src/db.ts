@@ -197,6 +197,34 @@ function backfillFtsIfNeeded(db: Db): void {
   `);
 }
 
+/** Blocks the current thread for `ms` — a synchronous sleep, safe to use before any I/O is in flight. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * The very first `journal_mode = WAL` against a file still in its original (rollback)
+ * journal mode does more than set a pragma — it performs the on-disk conversion to WAL,
+ * which needs exclusive access. Empirically (see the concurrent-boot test in db.test.ts)
+ * this specific pragma can throw `SQLITE_BUSY` under contention even with `busy_timeout`
+ * already set, unlike ordinary statement execution — busy_timeout's retry loop doesn't
+ * reliably cover this one operation. Retrying it ourselves at the JS level closes that
+ * gap regardless of the underlying SQLite/better-sqlite3 version's exact behavior here.
+ */
+function setWalModeWithRetry(db: Db): void {
+  const maxAttempts = 20;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      db.pragma('journal_mode = WAL');
+      return;
+    } catch (err) {
+      const isBusy = err instanceof Error && 'code' in err && (err as { code?: string }).code === 'SQLITE_BUSY';
+      if (!isBusy || attempt === maxAttempts) throw err;
+      sleepSync(50);
+    }
+  }
+}
+
 /**
  * Opens (and initializes) the SQLite database at `path`.
  * Pass ':memory:' for ephemeral/test databases.
@@ -210,14 +238,13 @@ export function openDb(path: string): Db {
   }
 
   const db = new Database(path);
-  // Set FIRST, before any other pragma or statement: `journal_mode = WAL` itself needs a
-  // brief lock and can hit SQLITE_BUSY under contention just like any other statement, so
-  // setting busy_timeout after it (as this code originally did) leaves a gap where a
-  // concurrent boot can still crash before its own busy_timeout is ever in effect. 10s is
-  // generous relative to how long the migration itself takes (milliseconds) — it only
-  // matters under contention (many boots racing at once), where waiting is exactly right.
+  // Set FIRST, before any other pragma or statement: this reduces (but per
+  // setWalModeWithRetry's own retry loop, does not have to fully eliminate) the window
+  // where a concurrent boot can hit SQLITE_BUSY before its own busy_timeout is in effect.
+  // 10s is generous relative to how long the migration itself takes (milliseconds) — it
+  // only matters under contention (many boots racing at once), where waiting is correct.
   db.pragma('busy_timeout = 10000');
-  db.pragma('journal_mode = WAL');
+  setWalModeWithRetry(db);
   db.pragma('foreign_keys = ON');
   runMigrations(db);
 
