@@ -70,6 +70,12 @@ export function TraceViewPage() {
       if (deepLink.section && trace.spans.some((s) => s.key === deepLink.section)) {
         setDrawerKey(deepLink.section);
       }
+      // Bring the deep-linked column into view once the charts have rendered.
+      requestAnimationFrame(() => {
+        document
+          .querySelector(`[data-segment-index="${wanted}"]`)
+          ?.scrollIntoView({ behavior: 'auto', inline: 'center', block: 'nearest' });
+      });
       return;
     }
     setSelectedIndex(last.index);
