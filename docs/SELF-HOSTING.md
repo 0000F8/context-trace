@@ -148,6 +148,16 @@ POST   /v1/admin/keys/:id/revoke       -> revokes immediately
 DELETE /v1/admin/projects/:id          -> cascades project + keys + sessions
 ```
 
+One display quirk worth knowing when you eyeball a key listing: the `prefix`
+shown for keys the server minted is the first 12 characters of the key
+itself (so it starts `ctw_`, `ctr_`, or `cta_`), but the key named
+`env-admin-key` — the one supplied via `CT_ADMIN_KEY` — shows a prefix
+derived from its *hash* instead. That's deliberate: `CT_ADMIN_KEY` is
+arbitrary operator-supplied input, and echoing its opening characters back
+through an API would leak part of a secret we didn't generate. It means the
+env admin key's prefix won't resemble the key you set; match it by the
+`env-admin-key` name instead.
+
 Admin routes are rate-limited (10 requests/minute/key) and don't exist at
 all outside `key` mode — an open local instance exposes no key management
 surface (`/v1/admin/*` 404s).

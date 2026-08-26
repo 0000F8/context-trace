@@ -222,7 +222,7 @@ describe('openDb', () => {
 
       for (const r of results) {
         expect(r.stderr).not.toMatch(/duplicate column name/);
-        expect(r.code).toBe(0);
+        expect(r.code, `exit code ${r.code}, stderr: ${r.stderr}`).toBe(0);
       }
 
       // The DB must end up fully and correctly migrated regardless of who won the race.
