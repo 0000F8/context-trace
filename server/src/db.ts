@@ -210,11 +210,15 @@ export function openDb(path: string): Db {
   }
 
   const db = new Database(path);
+  // Set FIRST, before any other pragma or statement: `journal_mode = WAL` itself needs a
+  // brief lock and can hit SQLITE_BUSY under contention just like any other statement, so
+  // setting busy_timeout after it (as this code originally did) leaves a gap where a
+  // concurrent boot can still crash before its own busy_timeout is ever in effect. 10s is
+  // generous relative to how long the migration itself takes (milliseconds) — it only
+  // matters under contention (many boots racing at once), where waiting is exactly right.
+  db.pragma('busy_timeout = 10000');
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
-  // Lets a connection that loses the BEGIN IMMEDIATE race in runMigrations (below) wait
-  // out the winner's migration instead of failing immediately with SQLITE_BUSY.
-  db.pragma('busy_timeout = 5000');
   runMigrations(db);
 
   const ftsOk = tryCreateFts(db);
