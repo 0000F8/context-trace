@@ -86,15 +86,15 @@ describe('bootstrapAuth', () => {
 
   it('hashes CT_ADMIN_KEY instead of generating one, and never re-inserts it across restarts', async () => {
     const db = openDb(':memory:');
-    const result = bootstrapAuth(db, { authMode: 'key', adminKeyEnv: 'cta_my-fixed-admin-key' });
+    const result = bootstrapAuth(db, { authMode: 'key', adminKeyEnv: 'cta_my-fixed-admin-key-that-is-long-enough' });
     expect(result.generatedAdminKey).toBeUndefined();
 
     const app = createApp(db, { authMode: 'key' });
-    const res = await app.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': 'cta_my-fixed-admin-key' } });
+    const res = await app.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': 'cta_my-fixed-admin-key-that-is-long-enough' } });
     expect(res.status).toBe(200);
 
     // Re-running boot with the same env key must not create a duplicate row.
-    bootstrapAuth(db, { authMode: 'key', adminKeyEnv: 'cta_my-fixed-admin-key' });
+    bootstrapAuth(db, { authMode: 'key', adminKeyEnv: 'cta_my-fixed-admin-key-that-is-long-enough' });
     expect(store.listProjectKeys(db, DEFAULT_PROJECT_ID).filter((k) => k.role === 'admin')).toHaveLength(1);
   });
 
@@ -102,6 +102,23 @@ describe('bootstrapAuth', () => {
     const db = openDb(':memory:');
     const result = bootstrapAuth(db, { authMode: 'key', apiKey: 'legacy-secret' });
     expect(result.legacyApiKeyIgnored).toBe(true);
+  });
+
+  it('rejects a CT_ADMIN_KEY shorter than 32 characters rather than accepting a weak admin secret', () => {
+    const db = openDb(':memory:');
+    expect(() => bootstrapAuth(db, { authMode: 'key', adminKeyEnv: 'hunter2' })).toThrow(/too short/);
+    expect(store.hasActiveAdminKey(db)).toBe(false);
+  });
+
+  it('derives the CT_ADMIN_KEY prefix from its hash, never from the plaintext, so a short/weak value cannot leak in full', () => {
+    // Exercises ensureAdminKeyFromEnv directly: bootstrapAuth's length gate is a separate
+    // guard, but the prefix itself must never be plaintext-derived as defense in depth.
+    const db = openDb(':memory:');
+    store.ensureAdminKeyFromEnv(db, 'hunter2');
+    const key = store.listProjectKeys(db, DEFAULT_PROJECT_ID).find((k) => k.role === 'admin');
+    expect(key?.prefix).toBeDefined();
+    expect(key?.prefix).not.toContain('hunter2');
+    expect(key?.prefix).not.toBe('hunter2');
   });
 });
 
@@ -145,7 +162,8 @@ describe('key mode', () => {
     projectA = project;
     readKey = store.createProjectKey(db, project.id, 'reader', 'read')!.key;
     writeKey = store.createProjectKey(db, project.id, 'writer', 'write')!.key;
-    adminKey = store.createProjectKey(db, project.id, 'admin', 'admin')!.key;
+    // Admin is instance-wide (spec3.md §C) and can only be minted for the default project.
+    adminKey = store.createProjectKey(db, DEFAULT_PROJECT_ID, 'admin', 'admin')!.key;
     app = createApp(db, { authMode: 'key' });
   });
 
@@ -214,6 +232,64 @@ describe('key mode', () => {
     expect(viaQuery.status).toBe(401);
     const viaHeader = await app.request(`${baseUrl()}/v1/sessions/s1/export`, { headers: { 'x-api-key': readKey } });
     expect(viaHeader.status).toBe(200);
+  });
+});
+
+describe('CORS on /v1/ingest (spec3.md §E — the browser SDK path)', () => {
+  it('none mode: an OPTIONS preflight succeeds with Access-Control-Allow-Origin', async () => {
+    const app = createApp(openDb(':memory:'));
+    const res = await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'OPTIONS',
+      headers: { origin: 'https://example.com', 'access-control-request-method': 'POST' },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('key mode: an OPTIONS preflight succeeds even with no key on the request (a real browser preflight never carries one)', async () => {
+    const app = createApp(openDb(':memory:'), { authMode: 'key' });
+    const res = await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'OPTIONS',
+      headers: { origin: 'https://example.com', 'access-control-request-method': 'POST' },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('key mode: a 401 on POST /v1/ingest (no key) still carries CORS headers, not an opaque CORS failure', async () => {
+    const app = createApp(openDb(':memory:'), { authMode: 'key' });
+    const res = await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://example.com' },
+      body: JSON.stringify({ events: [] }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('none mode + legacy CT_API_KEY: a 401 on POST /v1/ingest (no key) still carries CORS headers', async () => {
+    const app = createApp(openDb(':memory:'), { apiKey: 'secret' });
+    const res = await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://example.com' },
+      body: JSON.stringify({ events: [] }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('key mode: a valid key still lets the real POST through, with CORS headers present', async () => {
+    const db = openDb(':memory:');
+    const project = store.createProject(db, 'CorsProj');
+    const key = store.createProjectKey(db, project.id, 'w', 'write')!.key;
+    const app = createApp(db, { authMode: 'key' });
+    const res = await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://example.com', 'x-api-key': key },
+      body: JSON.stringify({ events: [] }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
   });
 });
 
@@ -341,6 +417,139 @@ describe('cross-project isolation: 404, never 403 (spec3.md §B/§J)', () => {
     expect(body.accepted).toBe(0);
     expect(body.rejected?.[0]?.reason).toBe('unknown session');
   });
+
+  it('CRITICAL: a foreign write key cannot hijack a victim segment by reusing its id under its own (legitimately-owned) session', async () => {
+    // Give the victim segment an outcome first — this is exactly what a reparenting bug
+    // would exfiltrate, since upsertSegment deliberately never touches `outcome`.
+    await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': keyA },
+      body: JSON.stringify({
+        events: [
+          {
+            type: 'segment.outcome',
+            data: {
+              sessionId: 'a-session',
+              segmentId: 'a-seg-0',
+              outcome: { responseText: 'VICTIM-PRIVATE-LLM-OUTPUT', model: 'victim-model' },
+            },
+          },
+        ],
+      }),
+    });
+
+    // Attacker (project B, write key) creates their OWN session — a legitimate write —
+    // then tries to claim the victim's existing segment id ('a-seg-0') under it. Session
+    // ownership alone can't catch this: 'attacker-session' genuinely belongs to project B.
+    // Only checking that seg.id doesn't already belong to a different project closes it.
+    const hijack = await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': writeKeyB },
+      body: JSON.stringify({
+        events: [
+          {
+            type: 'session.started',
+            data: { id: 'attacker-session', name: 'attacker', startedAt: new Date(2026, 0, 1).toISOString() },
+          },
+          {
+            type: 'segment.recorded',
+            data: {
+              id: 'a-seg-0', // the victim's existing segment id, reused
+              sessionId: 'attacker-session',
+              index: 0,
+              kind: 'llm_call',
+              timestamp: new Date(2026, 0, 1).toISOString(),
+              sections: [{ key: 'stolen', service: 'svc', serviceKind: 'memory', position: 0, content: 'attacker payload', tokens: 1 }],
+            },
+          },
+        ],
+      }),
+    });
+    const body = (await hijack.json()) as { accepted: number; rejected?: Array<{ index: number; reason: string }> };
+    expect(body.accepted).toBe(1); // session.started only
+    expect(body.rejected).toEqual([{ index: 1, reason: 'unknown segment' }]);
+
+    // The attacker's own session must not have gained the victim's segment.
+    const attackerExport = await app.request(`${baseUrl()}/v1/sessions/attacker-session/export`, {
+      headers: { 'x-api-key': writeKeyB },
+    });
+    const attackerBody = (await attackerExport.json()) as { segments: unknown[] };
+    expect(attackerBody.segments).toEqual([]);
+
+    // The victim's segment — sections AND outcome — must be completely untouched, still
+    // under project A. A fix that only re-validates sections (not outcome) would pass a
+    // narrower version of this assertion while remaining exploitable for exfiltration.
+    const victimDetail = await app.request(`${baseUrl()}/v1/sessions/a-session`, { headers: { 'x-api-key': keyA } });
+    const victimBody = (await victimDetail.json()) as {
+      segments: Array<{ id: string; outcome?: { responseText?: string; model?: string } }>;
+    };
+    expect(victimBody.segments).toHaveLength(1);
+    expect(victimBody.segments[0]?.outcome).toEqual({ responseText: 'VICTIM-PRIVATE-LLM-OUTPUT', model: 'victim-model' });
+
+    const victimSeg = await app.request(`${baseUrl()}/v1/sessions/a-session/segments/0`, { headers: { 'x-api-key': keyA } });
+    const victimSegBody = (await victimSeg.json()) as { sections: Array<{ key: string; content?: string }> };
+    expect(victimSegBody.sections).toEqual([expect.objectContaining({ key: 'notes', content: 'secret content' })]);
+  });
+
+  it('CRITICAL: /v1/import cannot hijack a victim segment via an owned session id + a foreign segment id, and rolls back atomically', async () => {
+    // Give the victim segment an outcome, same as the ingest-vector test above.
+    await app.request(`${baseUrl()}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': keyA },
+      body: JSON.stringify({
+        events: [
+          {
+            type: 'segment.outcome',
+            data: { sessionId: 'a-session', segmentId: 'a-seg-0', outcome: { responseText: 'VICTIM-SECRET-VIA-IMPORT' } },
+          },
+        ],
+      }),
+    });
+
+    // Attacker imports a brand-new session they own ('attacker-import-session'), but the
+    // one segment inside claims the victim's existing segment id ('a-seg-0'). The import
+    // route's own validation only checks that a segment's sessionId matches the imported
+    // session's own id (both 'attacker-import-session' here, so that check passes) — it
+    // never validates the segment id itself. Only the store-layer guard catches this.
+    const importRes = await app.request(`${baseUrl()}/v1/import`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': writeKeyB },
+      body: JSON.stringify({
+        version: 1,
+        session: { id: 'attacker-import-session', name: 'attacker', startedAt: new Date(2026, 0, 1).toISOString() },
+        segments: [
+          {
+            id: 'a-seg-0', // the victim's existing segment id, reused
+            sessionId: 'attacker-import-session',
+            index: 0,
+            kind: 'llm_call',
+            timestamp: new Date(2026, 0, 1).toISOString(),
+            sections: [{ key: 'stolen', service: 'svc', serviceKind: 'memory', position: 0, content: 'attacker payload', tokens: 1 }],
+          },
+        ],
+      }),
+    });
+    expect(importRes.status).toBe(400);
+    const importBody = (await importRes.json()) as { error: string };
+    expect(importBody.error).toMatch(/unknown segment/);
+
+    // Transactional: the whole import must roll back — the attacker's session must not
+    // exist at all afterward, not even the bare session.started half of the bundle.
+    const attackerSessionCheck = await app.request(`${baseUrl()}/v1/sessions/attacker-import-session`, {
+      headers: { 'x-api-key': writeKeyB },
+    });
+    expect(attackerSessionCheck.status).toBe(404);
+
+    // The victim's segment — sections AND outcome — must be completely untouched.
+    const victimDetail = await app.request(`${baseUrl()}/v1/sessions/a-session`, { headers: { 'x-api-key': keyA } });
+    const victimBody = (await victimDetail.json()) as { segments: Array<{ outcome?: { responseText?: string } }> };
+    expect(victimBody.segments).toHaveLength(1);
+    expect(victimBody.segments[0]?.outcome).toEqual({ responseText: 'VICTIM-SECRET-VIA-IMPORT' });
+
+    const victimSeg = await app.request(`${baseUrl()}/v1/sessions/a-session/segments/0`, { headers: { 'x-api-key': keyA } });
+    const victimSegBody = (await victimSeg.json()) as { sections: Array<{ key: string; content?: string }> };
+    expect(victimSegBody.sections).toEqual([expect.objectContaining({ key: 'notes', content: 'secret content' })]);
+  });
 });
 
 describe('admin routes (spec3.md §C)', () => {
@@ -353,7 +562,8 @@ describe('admin routes (spec3.md §C)', () => {
   beforeEach(() => {
     db = openDb(':memory:');
     const project = store.createProject(db, 'Bootstrap');
-    adminKey = store.createProjectKey(db, project.id, 'admin', 'admin')!.key;
+    // Admin is instance-wide (spec3.md §C) and can only be minted for the default project.
+    adminKey = store.createProjectKey(db, DEFAULT_PROJECT_ID, 'admin', 'admin')!.key;
     readKey = store.createProjectKey(db, project.id, 'reader', 'read')!.key;
     writeKey = store.createProjectKey(db, project.id, 'writer', 'write')!.key;
     app = createApp(db, { authMode: 'key' });
@@ -450,6 +660,58 @@ describe('admin routes (spec3.md §C)', () => {
     }
     expect(statuses.slice(0, 10)).toEqual(Array(10).fill(200));
     expect(statuses[10]).toBe(429);
+  });
+
+  it('refuses to mint an admin key for any project other than default (admin is instance-wide, not per-project)', async () => {
+    const projectRes = await app.request(`${baseUrl()}/v1/admin/projects`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': adminKey },
+      body: JSON.stringify({ name: 'NotDefault' }),
+    });
+    const project = (await projectRes.json()) as { id: string };
+    expect(project.id).not.toBe(DEFAULT_PROJECT_ID);
+
+    const keyRes = await app.request(`${baseUrl()}/v1/admin/projects/${project.id}/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': adminKey },
+      body: JSON.stringify({ name: 'sneaky-admin', role: 'admin' }),
+    });
+    expect(keyRes.status).toBe(400);
+    const body = (await keyRes.json()) as { error: string };
+    expect(body.error).toMatch(/instance-wide/);
+    expect(store.listProjectKeys(db, project.id)).toEqual([]);
+
+    // Minting an admin key for the default project must still work.
+    const defaultKeyRes = await app.request(`${baseUrl()}/v1/admin/projects/${DEFAULT_PROJECT_ID}/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': adminKey },
+      body: JSON.stringify({ name: 'second-admin', role: 'admin' }),
+    });
+    expect(defaultKeyRes.status).toBe(201);
+  });
+
+  it('refuses to delete the default project — deleting it would 401 the admin key making the call', async () => {
+    const res = await app.request(`${baseUrl()}/v1/admin/projects/${DEFAULT_PROJECT_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-api-key': adminKey },
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/default project/);
+
+    // The admin key must still work afterward — it was never at risk in the first place.
+    const stillWorks = await app.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } });
+    expect(stillWorks.status).toBe(200);
+    expect(store.getProject(db, DEFAULT_PROJECT_ID)).toBeDefined();
+  });
+
+  it('rejects an oversized body on an admin POST route (bodyLimit applies to /v1/admin/*, not just ingest)', async () => {
+    const res = await app.request(`${baseUrl()}/v1/admin/projects`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': adminKey },
+      body: JSON.stringify({ name: 'x'.repeat(11 * 1024 * 1024) }),
+    });
+    expect(res.status).toBe(413);
   });
 });
 
@@ -594,6 +856,63 @@ describe('keys CLI', () => {
       const db = openDb(dbPath);
       const row = db.prepare('SELECT COUNT(*) AS c FROM project_keys').get() as { c: number };
       expect(row.c).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('create-key admin against a non-default project errors clearly without creating a key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ct-cli-admin-scope-'));
+    const dbPath = join(dir, 'cli.db');
+    const tsxBin = resolveTsxBin();
+    const cliPath = join(process.cwd(), 'src', 'keys-cli.ts');
+    const env = { ...process.env, CT_DB: dbPath };
+
+    try {
+      const projectOut = execFileSync(tsxBin, [cliPath, 'create-project', 'NotDefault'], { env, encoding: 'utf8' });
+      const projectId = /created project (\S+)/.exec(projectOut)?.[1]!;
+      expect(projectId).toBeTruthy();
+
+      const result = spawnSync(tsxBin, [cliPath, 'create-key', projectId, 'sneaky-admin', 'admin'], { env, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/instance-wide/);
+
+      const listOut = execFileSync(tsxBin, [cliPath, 'list-keys', projectId], { env, encoding: 'utf8' });
+      expect(listOut).toContain('(no keys)');
+
+      // The default project must still accept an admin key.
+      const defaultResult = execFileSync(tsxBin, [cliPath, 'create-key', 'default', 'real-admin', 'admin'], {
+        env,
+        encoding: 'utf8',
+      });
+      expect(defaultResult).toMatch(/cta_/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('list-keys on a nonexistent project errors (matching the admin API\'s 404) instead of printing "(no keys)" and exiting 0', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ct-cli-listkeys-404-'));
+    const dbPath = join(dir, 'cli.db');
+    const tsxBin = resolveTsxBin();
+    const cliPath = join(process.cwd(), 'src', 'keys-cli.ts');
+    const env = { ...process.env, CT_DB: dbPath };
+
+    try {
+      const result = spawnSync(tsxBin, [cliPath, 'list-keys', 'nonexistent-project'], { env, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/no such project: nonexistent-project/);
+      expect(result.stdout).not.toContain('(no keys)');
+
+      // A real project with zero keys must still print "(no keys)" and exit 0 — the fix is
+      // about distinguishing "doesn't exist" from "exists but empty", not breaking the latter.
+      execFileSync(tsxBin, [cliPath, 'create-project', 'RealEmpty'], { env, encoding: 'utf8' });
+      const projects = execFileSync(tsxBin, [cliPath, 'list-projects'], { env, encoding: 'utf8' });
+      const realProjectId = /^(\S+)\s+RealEmpty/m.exec(projects)?.[1]!;
+      expect(realProjectId).toBeTruthy();
+      const okResult = spawnSync(tsxBin, [cliPath, 'list-keys', realProjectId], { env, encoding: 'utf8' });
+      expect(okResult.status).toBe(0);
+      expect(okResult.stdout).toContain('(no keys)');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

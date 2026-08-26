@@ -83,7 +83,7 @@ Only `flush()` and `shutdown()` return promises. Everything else (`startSession`
 - **Backpressure**: the queue is bounded by `maxQueue`. On overflow the oldest queued event is dropped (not the newest) and `onError` fires, so recent activity is preserved over stale activity.
 - **Outcome correlation**: `segment.outcome(o)` / `session.outcome(segmentId, o)` both just enqueue a `segment.outcome` event — same batching, retry, and drop semantics as any other event. The server does the actual correlation (matching `segmentId` against a previously ingested `segment.recorded`) and rejects the event with `'unknown segment'` if it can't find one; that per-event rejection surfaces through the normal partial-rejection `onError` path above, not as a special case.
 - **Option validation**: `maxBatch` and `maxQueue` are floored to whole numbers and must be `>= 1`; `flushIntervalMs` must be `>= 0`. A `NaN`, non-finite, or out-of-range value (including `maxBatch: 0`, which would otherwise make `flush()` loop forever splicing zero-length batches) is ignored and the default is used instead.
-- **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`.
+- **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`. **One deliberate exception**: `createClient(...)` and `session.segment(...)` throw synchronously on an unrecognized `contentMode` — see [Privacy modes](#privacy-modes) — since silently widening a privacy control to a less-private default is worse than a loud failure.
 - **Browser lifecycle flush**: in browsers, hiding or unloading the page triggers an immediate keepalive flush of everything queued (see "Using from a browser"). In Node this path is inert.
 - **`enabled: false`**: turns the client into a complete no-op — useful for disabling tracing in tests or specific environments without changing call sites.
 
@@ -168,6 +168,15 @@ const ct = createClient({
 ```
 
 - Return the section unchanged (or a rewritten copy) to keep it.
+- **The returned object REPLACES the section — it does not merge with the
+  original.** A field you omit from your return value is **absent**, not
+  silently inherited from the pre-redaction section. Concretely:
+  `redact: (s) => ({ key: s.key, service: s.service, serviceKind: s.serviceKind })`
+  drops `content` (and `role`, `tokens`, `metadata`) entirely — it does
+  **not** ship the original `content` just because the return value didn't
+  mention it. If you mean to keep most fields and change one, spread the
+  input and override only what you're changing:
+  `redact: (s) => ({ ...s, content: scrub(s.content ?? '') })`.
 - Return `null` to drop the section entirely — it never reaches the queue,
   and later sections in the same segment keep contiguous `position`s
   starting from 0 (no gap where the dropped section would have been).
@@ -185,6 +194,18 @@ replaces the client-level default for that one segment snapshot (it doesn't
 merge with it), in either direction: a `hash-only` client can opt one
 sensitive segment into `full`, and a `full` client can opt one segment into
 `hash-only`.
+
+**`contentMode` fails closed on an unrecognized value.** Unlike other SDK
+options (which sanitize an out-of-range number to a safe default),
+`contentMode` is a privacy control: an unrecognized string — a typo, a bad
+value from config, a plain-JS caller with no type checking — **throws**
+immediately (from `createClient(...)` for the client-level default, or from
+`session.segment(...)` for a per-segment override) instead of silently
+falling back to `'full'`. Silently widening a privacy setting on a typo
+would be worse than a loud, synchronous failure. This is a deliberate
+exception to `createClient`/`segment()`'s otherwise non-throwing contract.
+Both `'hash-only'` and `'hash_only'` (the Python SDK's spelling) are
+accepted as equivalent — only genuinely unrecognized values throw.
 
 ## Runtime
 

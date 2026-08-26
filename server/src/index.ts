@@ -20,7 +20,13 @@ try {
 
 const db = openDb(dbPath);
 
-const bootstrap = bootstrapAuth(db, { authMode, apiKey, adminKeyEnv });
+let bootstrap;
+try {
+  bootstrap = bootstrapAuth(db, { authMode, apiKey, adminKeyEnv });
+} catch (err) {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+}
 if (bootstrap.legacyApiKeyIgnored) {
   console.warn('CT_API_KEY is set but CT_AUTH=key is active: CT_API_KEY has no effect in key mode.');
 }

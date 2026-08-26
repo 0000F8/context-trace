@@ -109,16 +109,40 @@ function ensureProjectIdColumn(db: Db): void {
   db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)');
 }
 
-/** Boot creates the `default` project if absent, so 'none' mode always has somewhere to resolve to. */
+/**
+ * Boot creates the `default` project if absent, so 'none' mode always has somewhere to
+ * resolve to. `INSERT OR IGNORE` (rather than a separate SELECT-then-INSERT) makes this
+ * atomic on its own even outside `runMigrations`' transaction — belt and suspenders.
+ */
 function ensureDefaultProject(db: Db): void {
-  const exists = db.prepare('SELECT 1 FROM projects WHERE id = ?').get(DEFAULT_PROJECT_ID);
-  if (!exists) {
-    db.prepare('INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)').run(
-      DEFAULT_PROJECT_ID,
-      'Default',
-      new Date().toISOString()
-    );
-  }
+  db.prepare('INSERT OR IGNORE INTO projects (id, name, created_at) VALUES (?, ?, ?)').run(
+    DEFAULT_PROJECT_ID,
+    'Default',
+    new Date().toISOString()
+  );
+}
+
+/**
+ * Runs every schema/migration step as one `BEGIN IMMEDIATE` transaction, so concurrent
+ * boots against the same DB file (two Docker Compose instances racing on restart, `npm
+ * run keys` running during first boot, ...) serialize instead of interleaving. Without
+ * this, each guarded migration's "check pragma table_info, then ALTER" is a classic
+ * check-then-act race: two connections can both see the column missing and both attempt
+ * the `ALTER TABLE`, and the second gets a fatal "duplicate column name" error. Acquiring
+ * the write lock up front (`BEGIN IMMEDIATE`, not better-sqlite3's default `BEGIN
+ * DEFERRED`) means a second connection's own `.immediate()` call blocks — respecting
+ * `busy_timeout` — until the first fully commits, so its *check* only ever runs after the
+ * first connection's migration is already durable, never mid-flight.
+ */
+function runMigrations(db: Db): void {
+  const migrate = db.transaction(() => {
+    db.exec(SCHEMA);
+    ensureOutcomeColumn(db);
+    db.exec(PROJECT_SCHEMA);
+    ensureProjectIdColumn(db);
+    ensureDefaultProject(db);
+  });
+  migrate.immediate();
 }
 
 // Whether a given Db instance has a working sections_fts table — detected once at open
@@ -188,11 +212,10 @@ export function openDb(path: string): Db {
   const db = new Database(path);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
-  db.exec(SCHEMA);
-  ensureOutcomeColumn(db);
-  db.exec(PROJECT_SCHEMA);
-  ensureProjectIdColumn(db);
-  ensureDefaultProject(db);
+  // Lets a connection that loses the BEGIN IMMEDIATE race in runMigrations (below) wait
+  // out the winner's migration instead of failing immediately with SQLITE_BUSY.
+  db.pragma('busy_timeout = 5000');
+  runMigrations(db);
 
   const ftsOk = tryCreateFts(db);
   setFtsSupport(db, ftsOk);

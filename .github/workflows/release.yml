@@ -46,6 +46,48 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+      # A manual dispatch is the only thing that can publish here — nothing
+      # gates it on CI having passed first, so verify explicitly rather than
+      # trusting that whoever clicked "run workflow" also checked main was
+      # green.
+      - run: npm run test
+
+      - name: Verify version consistency
+        run: |
+          node -e '
+            const fs = require("fs");
+            const types = require("./packages/types/package.json");
+            const sdk = require("./packages/sdk/package.json");
+            const langchain = require("./packages/langchain/package.json");
+            const pyproject = fs.readFileSync("./sdk-python/pyproject.toml", "utf8");
+            const pyMatch = pyproject.match(/^version\s*=\s*"([^"]+)"/m);
+            const pyVersion = pyMatch ? pyMatch[1] : null;
+
+            const versions = { types: types.version, sdk: sdk.version, langchain: langchain.version, "sdk-python": pyVersion };
+            const problems = [];
+
+            const first = versions.types;
+            for (const [name, v] of Object.entries(versions)) {
+              if (v !== first) problems.push(`${name} is ${v}, expected ${first}`);
+            }
+            if (sdk.dependencies["@context-trace/types"] !== types.version) {
+              problems.push(`sdk depends on @context-trace/types@${sdk.dependencies["@context-trace/types"]} but types is ${types.version}`);
+            }
+            if (langchain.dependencies["@context-trace/types"] !== types.version) {
+              problems.push(`langchain depends on @context-trace/types@${langchain.dependencies["@context-trace/types"]} but types is ${types.version}`);
+            }
+            if (langchain.dependencies["@context-trace/sdk"] !== sdk.version) {
+              problems.push(`langchain depends on @context-trace/sdk@${langchain.dependencies["@context-trace/sdk"]} but sdk is ${sdk.version}`);
+            }
+
+            if (problems.length > 0) {
+              console.error("Version mismatch across published packages:");
+              for (const p of problems) console.error(" - " + p);
+              process.exit(1);
+            }
+            console.log(`All published packages consistent at version ${first}.`);
+          '
+
       - name: Check for NPM_TOKEN
         id: npmcheck
         env:
@@ -107,6 +149,10 @@ jobs:
           else
             echo "have_token=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Run Python test suite
+        if: steps.pypicheck.outputs.have_token == 'true'
+        run: python -m unittest discover -s sdk-python/tests
 
       - name: Build sdist and wheel
         if: steps.pypicheck.outputs.have_token == 'true'

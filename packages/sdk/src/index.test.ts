@@ -717,6 +717,125 @@ describe('redact', () => {
     if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
     expect(recorded.data.sections[0]?.content).toBe('plain');
   });
+
+  it('replaces rather than merges: a returned section omitting content drops it, never falling back to the original', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      // Deliberately returns a new object with no `content` field at all,
+      // simulating a redactor that strips fields by omission rather than
+      // by spreading the original and overriding just `content`.
+      redact: (s) => ({ key: s.key, service: s.service, serviceKind: s.serviceKind }),
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({
+      key: 'a',
+      service: 'svc',
+      serviceKind: 'other',
+      content: 'sk-live-DEADBEEF-super-secret',
+    });
+    seg.record();
+
+    await ct.flush();
+
+    const rawBody = String(
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit?])[1]?.body,
+    );
+    expect(rawBody).not.toContain('sk-live-DEADBEEF-super-secret');
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBeUndefined();
+  });
+});
+
+describe('content mode validation (fail closed)', () => {
+  it('throws on an unrecognized client-level contentMode instead of silently using full', () => {
+    expect(() =>
+      createClient({
+        endpoint: 'http://localhost:4720',
+        flushIntervalMs: 0,
+        // @ts-expect-error deliberately invalid at the type level too
+        contentMode: 'redacted',
+      }),
+    ).toThrow(/invalid contentMode/i);
+  });
+
+  it('throws on an unrecognized per-segment contentMode override instead of silently downgrading to full', () => {
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    const session = ct.startSession({ name: 's' });
+    expect(() =>
+      session.segment({
+        kind: 'llm_call',
+        // @ts-expect-error deliberately invalid at the type level too
+        contentMode: 'hush-only', // plausible typo of 'hash-only'
+      }),
+    ).toThrow(/invalid contentMode/i);
+  });
+
+  it('accepts the "hash_only" (underscore) spelling as an alias at the client level', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      // @ts-expect-error 'hash_only' isn't in the TS union, but must still work at runtime
+      contentMode: 'hash_only',
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'secret' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBeUndefined();
+  });
+
+  it('accepts the "hash_only" (underscore) spelling as a per-segment override alias', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    // @ts-expect-error 'hash_only' isn't in the TS union, but must still work at runtime
+    const seg = session.segment({ kind: 'llm_call', contentMode: 'hash_only' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'secret' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBeUndefined();
+  });
+
+  it('regression: valid contentMode values ("full" and "hash-only") never throw, at either level', () => {
+    expect(() => createClient({ endpoint: 'http://localhost:4720', contentMode: 'full' })).not.toThrow();
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    const session = ct.startSession({ name: 's' });
+    expect(() => session.segment({ contentMode: 'full' })).not.toThrow();
+    expect(() => session.segment({ contentMode: 'hash-only' })).not.toThrow();
+    expect(() => createClient({ endpoint: 'http://localhost:4720' })).not.toThrow(); // omitted entirely
+  });
 });
 
 describe('hash-only outcome (responseText)', () => {

@@ -146,7 +146,28 @@ function getSessionProjectId(db: Db, sessionId: string): string | undefined {
   return row?.project_id;
 }
 
-export function upsertSession(db: Db, session: Session, projectId: string = DEFAULT_PROJECT_ID): void {
+/**
+ * Looks up a segment's owning project by joining through its session. `segments` has no
+ * `project_id` of its own and `segments.id` is a global PK with
+ * `ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id` — without this check,
+ * upsertSegment would only ever validate the *session* id it was told about, never the
+ * *segment* id it's about to write. A write naming a segment id that already belongs to
+ * another project would silently reparent that segment (sections cleared and replaced,
+ * `session_id` repointed) into the caller's own session, while its `outcome` — deliberately
+ * never touched by upsertSegment — rides along and becomes readable there. Same rejection
+ * shape as `getSessionProjectId`: 'unknown segment', not a leak of who really owns it.
+ */
+function getSegmentProjectId(db: Db, segmentId: string): string | undefined {
+  const row = db
+    .prepare(
+      `SELECT s.project_id AS project_id FROM segments seg
+       JOIN sessions s ON s.id = seg.session_id WHERE seg.id = ?`
+    )
+    .get(segmentId) as { project_id: string } | undefined;
+  return row?.project_id;
+}
+
+export function upsertSession(db: Db, session: Session, projectId: string): void {
   const existingProjectId = getSessionProjectId(db, session.id);
   if (existingProjectId !== undefined && existingProjectId !== projectId) {
     throw new Error('unknown session');
@@ -171,7 +192,7 @@ export function upsertSession(db: Db, session: Session, projectId: string = DEFA
   });
 }
 
-export function ensureStubSession(db: Db, sessionId: string, timestamp: string, projectId: string = DEFAULT_PROJECT_ID): void {
+export function ensureStubSession(db: Db, sessionId: string, timestamp: string, projectId: string): void {
   const existingProjectId = getSessionProjectId(db, sessionId);
   if (existingProjectId !== undefined) {
     if (existingProjectId !== projectId) throw new Error('unknown session');
@@ -183,7 +204,7 @@ export function ensureStubSession(db: Db, sessionId: string, timestamp: string, 
   ).run(sessionId, `stub-${sessionId}`, timestamp, projectId);
 }
 
-export function upsertSegment(db: Db, segment: SegmentWithSections, projectId: string = DEFAULT_PROJECT_ID): void {
+export function upsertSegment(db: Db, segment: SegmentWithSections, projectId: string): void {
   const upsertSegmentStmt = db.prepare(
     `INSERT INTO segments (id, session_id, idx, label, kind, model, timestamp, metadata)
      VALUES (@id, @session_id, @idx, @label, @kind, @model, @timestamp, @metadata)
@@ -215,6 +236,10 @@ export function upsertSegment(db: Db, segment: SegmentWithSections, projectId: s
     // Inside the transaction: if anything below throws (e.g. a constraint violation),
     // the stub-session insert rolls back too, instead of leaving a phantom empty session
     // behind for a segment that was ultimately rejected.
+    const segmentOwner = getSegmentProjectId(db, seg.id);
+    if (segmentOwner !== undefined && segmentOwner !== projectId) {
+      throw new Error('unknown segment');
+    }
     ensureStubSession(db, seg.sessionId, seg.timestamp, projectId);
     upsertSegmentStmt.run({
       id: seg.id,
@@ -280,7 +305,7 @@ export function applySegmentOutcome(
   sessionId: string,
   segmentId: string,
   outcome: SegmentOutcome,
-  projectId: string = DEFAULT_PROJECT_ID
+  projectId: string
 ): boolean {
   const result = db
     .prepare(
@@ -296,7 +321,7 @@ export function getSegmentIndexById(
   db: Db,
   sessionId: string,
   segmentId: string,
-  projectId: string = DEFAULT_PROJECT_ID
+  projectId: string
 ): number | undefined {
   const row = db
     .prepare(
@@ -313,14 +338,14 @@ export function getSegmentIndexById(
  * callers can reject the event instead of silently creating (or resurrecting a just-deleted)
  * session from an end event alone.
  */
-export function endSession(db: Db, sessionId: string, endedAt: string, projectId: string = DEFAULT_PROJECT_ID): boolean {
+export function endSession(db: Db, sessionId: string, endedAt: string, projectId: string): boolean {
   const result = db
     .prepare('UPDATE sessions SET ended_at = ? WHERE id = ? AND project_id = ?')
     .run(endedAt, sessionId, projectId);
   return result.changes > 0;
 }
 
-export function deleteSession(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): boolean {
+export function deleteSession(db: Db, id: string, projectId: string): boolean {
   // sections_fts is a virtual table: the sessions/segments/sections FK cascade
   // (ON DELETE CASCADE) never reaches it, so it needs its own explicit cleanup.
   const tx = db.transaction((sessionId: string) => {
@@ -436,11 +461,11 @@ function buildSessionSummary(db: Db, row: SessionRow): SessionSummary {
   };
 }
 
-export function sessionExists(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): boolean {
+export function sessionExists(db: Db, id: string, projectId: string): boolean {
   return Boolean(db.prepare('SELECT 1 FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId));
 }
 
-export function getSessionSummary(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): SessionSummary | undefined {
+export function getSessionSummary(db: Db, id: string, projectId: string): SessionSummary | undefined {
   const row = db.prepare('SELECT * FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId) as
     | SessionRow
     | undefined;
@@ -448,7 +473,7 @@ export function getSessionSummary(db: Db, id: string, projectId: string = DEFAUL
   return buildSessionSummary(db, row);
 }
 
-export function getStats(db: Db, projectId: string = DEFAULT_PROJECT_ID): Stats {
+export function getStats(db: Db, projectId: string): Stats {
   const sessions = (
     db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE project_id = ?').get(projectId) as { c: number }
   ).c;
@@ -504,12 +529,12 @@ export interface ListSessionsOptions {
   limit: number;
   offset: number;
   q?: string;
-  projectId?: string;
+  projectId: string;
 }
 
 export function listSessions(db: Db, opts: ListSessionsOptions): { sessions: SessionSummary[]; total: number } {
   const q = opts.q?.trim();
-  const projectId = opts.projectId ?? DEFAULT_PROJECT_ID;
+  const projectId = opts.projectId;
   let rows: SessionRow[];
   let total: number;
 
@@ -541,7 +566,7 @@ export function listSessions(db: Db, opts: ListSessionsOptions): { sessions: Ses
   return { sessions, total };
 }
 
-export function getSessionDetail(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): SessionDetail | undefined {
+export function getSessionDetail(db: Db, id: string, projectId: string): SessionDetail | undefined {
   const row = db.prepare('SELECT * FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId) as
     | SessionRow
     | undefined;
@@ -574,7 +599,7 @@ export function getSessionDetail(db: Db, id: string, projectId: string = DEFAULT
   return { ...summary, segments: segmentSummaries };
 }
 
-export function getSessionTrace(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): CompiledTrace | undefined {
+export function getSessionTrace(db: Db, id: string, projectId: string): CompiledTrace | undefined {
   const summary = getSessionSummary(db, id, projectId);
   if (!summary) return undefined;
   // The compiled trace never surfaces section content (ops/spans/services are all
@@ -587,7 +612,7 @@ export function getSegmentDetail(
   db: Db,
   sessionId: string,
   index: number,
-  projectId: string = DEFAULT_PROJECT_ID
+  projectId: string
 ): SegmentDetail | undefined {
   const sessionOwned = db.prepare('SELECT 1 FROM sessions WHERE id = ? AND project_id = ?').get(sessionId, projectId);
   if (!sessionOwned) return undefined;
@@ -654,7 +679,7 @@ export function getSegmentDetail(
 export interface SearchOptions {
   q: string;
   limit: number;
-  projectId?: string;
+  projectId: string;
 }
 
 // Snippet highlight markers, pinned to control chars U+0001/U+0002 (not literal '[' /
@@ -674,7 +699,7 @@ export const SNIPPET_MARK_CLOSE = String.fromCharCode(2);
  */
 export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
   const phrase = `"${opts.q.replace(/"/g, '""')}"`;
-  const projectId = opts.projectId ?? DEFAULT_PROJECT_ID;
+  const projectId = opts.projectId;
   const rows = db
     .prepare(
       `SELECT f.session_id AS session_id, s.name AS session_name, f.segment_index AS segment_index,
@@ -709,7 +734,7 @@ export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
 // Export
 // ---------------------------------------------------------------------------
 
-export function exportSession(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): SessionExport | undefined {
+export function exportSession(db: Db, id: string, projectId: string): SessionExport | undefined {
   const row = db.prepare('SELECT * FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId) as
     | SessionRow
     | undefined;
@@ -772,21 +797,28 @@ export function getProject(db: Db, id: string): Project | undefined {
  * sessions themselves are deleted explicitly here — which then cascades to their
  * segments/sections via the existing FK, with the same manual sections_fts cleanup
  * `deleteSession` needs for the same reason (FTS is a virtual table, outside FK cascade).
+ *
+ * Filters by `project_id` directly (a subquery for the FTS cleanup) rather than
+ * collecting every session id first and building one bound `?` per id: that older
+ * approach both risked hitting SQLite's bound-parameter limit on a large project (a
+ * fatal error, not a graceful one) and made such a project permanently undeletable.
+ *
+ * Refuses to delete the `default` project: it's hardcoded as the target for 'none' mode
+ * and for the bootstrap/env-supplied admin key (`insertBootstrapAdminKey`,
+ * `ensureAdminKeyFromEnv`), so deleting it would both break every existing-install read
+ * in 'none' mode and 401 the very admin key that just made this call.
  */
 export function deleteProject(db: Db, id: string): boolean {
+  if (id === DEFAULT_PROJECT_ID) {
+    throw new Error('cannot delete the default project');
+  }
   const tx = db.transaction((projectId: string) => {
-    const sessionIds = (
-      db.prepare('SELECT id FROM sessions WHERE project_id = ?').all(projectId) as Array<{ id: string }>
-    ).map((r) => r.id);
-    if (sessionIds.length > 0) {
-      const placeholders = sessionIds.map(() => '?').join(',');
-      if (hasFtsSupport(db)) {
-        db.prepare(
-          `DELETE FROM sections_fts WHERE segment_id IN (SELECT id FROM segments WHERE session_id IN (${placeholders}))`
-        ).run(...sessionIds);
-      }
-      db.prepare(`DELETE FROM sessions WHERE id IN (${placeholders})`).run(...sessionIds);
+    if (hasFtsSupport(db)) {
+      db.prepare(
+        `DELETE FROM sections_fts WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?)`
+      ).run(projectId);
     }
+    db.prepare('DELETE FROM sessions WHERE project_id = ?').run(projectId);
     return db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
   });
   const result = tx(id);
@@ -818,9 +850,21 @@ function keyRowToInfo(row: ProjectKeyRow): ProjectKeyInfo {
   };
 }
 
-/** Mints and persists a new key for `projectId`. Returns undefined if the project doesn't exist. */
+/**
+ * Mints and persists a new key for `projectId`. Returns undefined if the project doesn't
+ * exist. Throws if `role === 'admin'` and `projectId` isn't the default project: admin
+ * routes (`/v1/admin/*`) are instance-wide by design — GET /v1/admin/projects lists every
+ * project, DELETE /v1/admin/projects/:id can remove any of them — so an admin key minted
+ * for a non-default project would be a project-scoped credential with instance-wide
+ * power, not a per-project admin. Restricting minting to `default` keeps the code and the
+ * "admin is instance-wide" story in the docs in agreement, and matches what
+ * `deploy/single-tenant/provision.sh` already does (it only ever mints against `default`).
+ */
 export function createProjectKey(db: Db, projectId: string, name: string, role: KeyRole): CreatedProjectKey | undefined {
   if (!getProject(db, projectId)) return undefined;
+  if (role === 'admin' && projectId !== DEFAULT_PROJECT_ID) {
+    throw new Error('admin keys are instance-wide and can only be created for the default project');
+  }
   const minted = mintKey(role);
   const id = generateId('key');
   const createdAt = new Date().toISOString();
@@ -870,7 +914,15 @@ export function insertBootstrapAdminKey(db: Db, minted: { hash: string; prefix: 
   ).run(id, DEFAULT_PROJECT_ID, minted.hash, minted.prefix, new Date().toISOString());
 }
 
-/** Hashes `plaintext` (from CT_ADMIN_KEY) and stores it if not already present — idempotent across restarts. */
+/**
+ * Hashes `plaintext` (from CT_ADMIN_KEY) and stores it if not already present — idempotent
+ * across restarts. The display `prefix` is deliberately derived from the *hash*, not the
+ * plaintext: minted keys (`mintKey`) are always long enough that their first 12 chars are
+ * safe to display, but CT_ADMIN_KEY is operator-supplied and could be short — slicing the
+ * plaintext would leak an entire short secret (e.g. `CT_ADMIN_KEY=hunter2`) through the
+ * "metadata only" key-listing endpoint. `bootstrapAuth` separately rejects anything under
+ * MIN_ADMIN_KEY_LENGTH at boot; this hash-derived prefix is defense in depth on top of that.
+ */
 export function ensureAdminKeyFromEnv(db: Db, plaintext: string): void {
   const hash = hashKey(plaintext);
   const existing = db.prepare('SELECT 1 FROM project_keys WHERE key_hash = ?').get(hash);
@@ -879,7 +931,7 @@ export function ensureAdminKeyFromEnv(db: Db, plaintext: string): void {
   db.prepare(
     `INSERT INTO project_keys (id, project_id, name, role, key_hash, prefix, created_at)
      VALUES (?, ?, 'env-admin-key', 'admin', ?, ?, ?)`
-  ).run(id, DEFAULT_PROJECT_ID, hash, plaintext.slice(0, 12), new Date().toISOString());
+  ).run(id, DEFAULT_PROJECT_ID, hash, hash.slice(0, 12), new Date().toISOString());
 }
 
 /** Updates `last_used_at`; callers throttle this to at most once/minute/key themselves. */

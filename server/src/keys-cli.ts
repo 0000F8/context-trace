@@ -82,9 +82,14 @@ function main(): void {
         console.log('(no projects)');
         break;
       }
-      console.log('id'.padEnd(24) + 'name'.padEnd(24) + 'createdAt');
+      // Column widths sized for the real data, not guessed: generateId('proj') is 28
+      // chars and generateId('key') is 27 (a 4-9-char role/kind prefix + '_' + 23-char
+      // body), and ISO timestamps are exactly 24 chars — padEnd(24) on either left zero
+      // gap before the next column, running the list->copy/paste-into-revoke workflow
+      // together.
+      console.log('id'.padEnd(32) + 'name'.padEnd(22) + 'createdAt');
       for (const p of projects) {
-        console.log(p.id.padEnd(24) + p.name.padEnd(24) + p.createdAt);
+        console.log(p.id.padEnd(32) + p.name.padEnd(22) + p.createdAt);
       }
       break;
     }
@@ -105,8 +110,15 @@ function main(): void {
         process.exit(1);
       }
       // createProjectKey checks the project exists before writing anything — a bad
-      // projectId here fails cleanly rather than leaving an orphaned key row.
-      const created = store.createProjectKey(db, projectId, name, role);
+      // projectId here fails cleanly rather than leaving an orphaned key row. It also
+      // throws if role is 'admin' for a non-default project (admin is instance-wide).
+      let created;
+      try {
+        created = store.createProjectKey(db, projectId, name, role);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : 'invalid request');
+        process.exit(1);
+      }
       if (!created) {
         console.error(`no such project: ${projectId}`);
         process.exit(1);
@@ -125,21 +137,27 @@ function main(): void {
     case 'list-keys': {
       const [projectId] = args;
       if (!projectId) usage();
+      // Matches the admin API's 404 for an unknown project, rather than printing
+      // "(no keys)" and exiting 0 — the two must agree on what "unknown" looks like.
+      if (!store.getProject(db, projectId)) {
+        console.error(`no such project: ${projectId}`);
+        process.exit(1);
+      }
       const keys = store.listProjectKeys(db, projectId);
       if (keys.length === 0) {
         console.log('(no keys)');
         break;
       }
       console.log(
-        'id'.padEnd(24) + 'name'.padEnd(20) + 'role'.padEnd(8) + 'prefix'.padEnd(14) + 'lastUsedAt'.padEnd(24) + 'revokedAt'
+        'id'.padEnd(32) + 'name'.padEnd(22) + 'role'.padEnd(8) + 'prefix'.padEnd(16) + 'lastUsedAt'.padEnd(26) + 'revokedAt'
       );
       for (const k of keys) {
         console.log(
-          k.id.padEnd(24) +
-            k.name.padEnd(20) +
+          k.id.padEnd(32) +
+            k.name.padEnd(22) +
             k.role.padEnd(8) +
-            k.prefix.padEnd(14) +
-            fmtDate(k.lastUsedAt).padEnd(24) +
+            k.prefix.padEnd(16) +
+            fmtDate(k.lastUsedAt).padEnd(26) +
             fmtDate(k.revokedAt)
         );
       }

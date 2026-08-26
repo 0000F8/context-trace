@@ -180,7 +180,12 @@ Identical to the TypeScript SDK:
 - **Backpressure**: the queue is bounded by `max_queue`. On overflow the
   oldest queued event is dropped (not the newest) and `on_error` fires.
 - **Never raises**: capture calls, `flush()`, and `shutdown()` never raise
-  into your app. All failures surface only via `on_error`.
+  into your app. All failures surface only via `on_error`. **Two
+  deliberate exceptions**: an invalid `endpoint` scheme (see above) and an
+  unrecognized `content_mode` passed to `ContextTraceClient(...)` or
+  `session.segment(...)` both raise `ValueError` synchronously — see
+  [Privacy modes](#privacy-modes) for why `content_mode` fails closed
+  rather than falling back to a default.
 - **`enabled=False`**: turns the client into a complete no-op.
 
 ## Privacy modes
@@ -262,6 +267,15 @@ ct = ContextTraceClient(endpoint="http://localhost:4720", redact=redact)
 ```
 
 - Return the section dict unchanged (or a rewritten copy) to keep it.
+- **The returned dict REPLACES the section — it does not merge with the
+  original.** A key you omit from your return value is **absent**, not
+  silently inherited from the pre-redaction section. Concretely:
+  `redact = lambda s: {"key": s["key"], "service": s["service"], "service_kind": s["service_kind"]}`
+  drops `content` (and `role`, `tokens`, `metadata`) entirely — it does
+  **not** ship the original `content` just because the return value didn't
+  mention it. If you mean to keep most fields and change one, copy the
+  input and override only what you're changing:
+  `redact = lambda s: {**s, "content": scrub(s["content"] or "")}`.
 - Return `None` to drop the section entirely — it never reaches the queue,
   and later sections in the same segment keep contiguous `position`s
   starting from 0 (no gap where the dropped section would have been).
@@ -279,6 +293,19 @@ replaces the client-level default entirely for that one segment snapshot
 (it doesn't merge with it), in either direction: a `hash_only` client can
 opt one sensitive segment into `'full'`, and a `'full'` client can opt one
 segment into `'hash_only'`.
+
+**`content_mode` fails closed on an unrecognized value.** Unlike other SDK
+options (which sanitize an out-of-range number to a safe default),
+`content_mode` is a privacy control: an unrecognized string — a typo, a bad
+value from config — **raises `ValueError`** immediately (from
+`ContextTraceClient(...)` for the client-level default, or from
+`session.segment(...)` for a per-segment override) instead of silently
+falling back to `'full'`. Silently widening a privacy setting on a typo
+would be worse than a loud, synchronous failure. This is a deliberate
+exception to the constructor/`segment()`'s otherwise non-raising contract
+(the endpoint-scheme check is the other one — see below). Both
+`'hash_only'` and `'hash-only'` (the TS SDK's spelling) are accepted as
+equivalent — only genuinely unrecognized values raise.
 
 ## Hashing and token estimation
 

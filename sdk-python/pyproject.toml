@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "context-trace"
-version = "0.1.0"
+version = "0.3.0"
 description = "Zero-dependency Python client for capturing LLM context assemblies and shipping them to a context-trace server."
 readme = "README.md"
 requires-python = ">=3.8"

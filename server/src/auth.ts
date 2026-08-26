@@ -44,10 +44,18 @@ export interface BootstrapResult {
 }
 
 /**
+ * Minted keys (`mintKey`) are always well over this length, so it's a floor on
+ * operator-supplied CT_ADMIN_KEY values only. Below it, the admin-listing endpoint's
+ * "first 12 chars" display prefix could expose the entire secret (e.g. `hunter2`).
+ */
+const MIN_ADMIN_KEY_LENGTH = 32;
+
+/**
  * Ensures an admin key exists when running in 'key' mode. `CT_ADMIN_KEY` supplies one
  * (hashed at boot, idempotent across restarts); otherwise, if no active admin key exists
  * yet, a fresh one is minted and its plaintext returned for the caller to print once.
- * No-op outside 'key' mode.
+ * No-op outside 'key' mode. Throws if CT_ADMIN_KEY is set but too short to be a real
+ * secret — the caller should fail boot rather than silently accepting a weak admin key.
  */
 export function bootstrapAuth(
   db: Db,
@@ -57,6 +65,11 @@ export function bootstrapAuth(
   if (opts.authMode !== 'key') return { legacyApiKeyIgnored };
 
   if (opts.adminKeyEnv) {
+    if (opts.adminKeyEnv.length < MIN_ADMIN_KEY_LENGTH) {
+      throw new Error(
+        `CT_ADMIN_KEY is too short (${opts.adminKeyEnv.length} chars) — must be at least ${MIN_ADMIN_KEY_LENGTH} characters`
+      );
+    }
     store.ensureAdminKeyFromEnv(db, opts.adminKeyEnv);
     return { legacyApiKeyIgnored };
   }

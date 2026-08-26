@@ -62,6 +62,33 @@ def _sanitize_int_option(value: Optional[int], fallback: int, minimum: int) -> i
     return int(math.floor(fv))
 
 
+def _normalize_content_mode(value: str, context: str) -> str:
+    """
+    Validate a `content_mode`. Unlike `_sanitize_*_option` above, an
+    unrecognized value here does NOT fall back to a default — it raises.
+    `content_mode` is a privacy control: silently normalizing a typo to
+    "full" would ship content the caller believed was being withheld, with
+    no signal that anything went wrong. Fail closed instead: refuse to
+    construct a client, or open a segment, with an unrecognized mode.
+    `None` is a distinct case (means "not overridden, use the
+    fallback/default") and is handled by the caller before this function is
+    reached — it is never passed in as `value` here.
+
+    Accepts `"hash-only"` (hyphen) as an alias for `"hash_only"` in addition
+    to raising on genuinely unknown values, since the TS SDK's canonical
+    spelling is `'hash-only'` and this is the one cross-language footgun
+    worth closing outright rather than just documenting.
+    """
+    if value == "full":
+        return "full"
+    if value in ("hash_only", "hash-only"):
+        return "hash_only"
+    raise ValueError(
+        f"context-trace: invalid content_mode {value!r} ({context}); "
+        "expected 'full' or 'hash_only'"
+    )
+
+
 class IngestHttpError(Exception):
     """Raised by _send() for a non-2xx HTTP response; carries the status for retry classification."""
 
@@ -153,10 +180,12 @@ class ContextTraceClient:
         self._on_error = on_error
         self._enabled = bool(enabled)
         # Client-level defaults, overridable per segment (see
-        # SessionHandle.segment). Any value other than "hash_only" falls
-        # back to "full" rather than raising, mirroring the TS SDK's
-        # tolerant handling of an invalid contentMode.
-        self._content_mode = "hash_only" if content_mode == "hash_only" else "full"
+        # SessionHandle.segment). An unrecognized content_mode raises
+        # rather than silently falling back to "full" — see
+        # _normalize_content_mode.
+        self._content_mode = _normalize_content_mode(
+            content_mode, "ContextTraceClient(content_mode=...)"
+        )
         self._redact = redact
 
         # Single lock guarding the queue and the session-handle cache (and,
@@ -502,11 +531,16 @@ class SessionHandle:
         ts = timestamp or _now_iso()
         # Per-segment override wins in both directions: an explicit
         # content_mode/redact here replaces the client default entirely for
-        # this segment, rather than merging with it.
+        # this segment, rather than merging with it. An unrecognized
+        # content_mode raises here (see _normalize_content_mode) rather
+        # than silently downgrading this segment to "full" — a deliberate
+        # exception to segment()'s usual non-raising contract, since
+        # silently widening a privacy control is worse than a loud failure.
         effective_content_mode = (
-            self._client._content_mode if content_mode is None else content_mode
+            self._client._content_mode
+            if content_mode is None
+            else _normalize_content_mode(content_mode, "session.segment(content_mode=...)")
         )
-        effective_content_mode = "hash_only" if effective_content_mode == "hash_only" else "full"
         effective_redact = self._client._redact if redact is None else redact
         return SegmentBuilder(
             self._client,
@@ -611,13 +645,23 @@ class SegmentBuilder:
                         return self
                     if result is None:
                         return self  # dropped; position stays contiguous
-                    key = result.get("key", key)
-                    service = result.get("service", service)
-                    service_kind = result.get("service_kind", service_kind)
-                    role = result.get("role", role)
-                    content = result.get("content", content)
-                    tokens = result.get("tokens", tokens)
-                    metadata = result.get("metadata", metadata)
+                    # Full replacement, mirroring the TS SDK: the dict
+                    # `redact` returns IS the section going forward, not a
+                    # set of overrides merged onto the pre-redaction
+                    # section. A field the callback omits from its return
+                    # value is therefore absent here — NOT silently
+                    # inherited from the original `content`/etc. above. A
+                    # redactor that means to keep a field unchanged must
+                    # return it explicitly (e.g. build the return value
+                    # from `dict(section_input)` and only override what it
+                    # actually wants to change).
+                    key = result.get("key")
+                    service = result.get("service")
+                    service_kind = result.get("service_kind")
+                    role = result.get("role")
+                    content = result.get("content")
+                    tokens = result.get("tokens")
+                    metadata = result.get("metadata")
 
                 # contentHash and tokens are always derived from the real
                 # (redacted) content, computed before any hash-only

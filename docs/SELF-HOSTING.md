@@ -83,15 +83,22 @@ In `key` mode, every session belongs to a project (a `default` project
 always exists). A key format encodes its role at a glance:
 `cta_...` (admin), `ctw_...` (write), `ctr_...` (read) — 32 random bytes,
 shown once, stored only as a SHA-256 hash plus a 12-character display
-prefix. Reads/writes for a key scope strictly to that key's project — a
-session in another project is a 404, never a 403, so a key never learns a
-different project even exists.
+prefix. Read/write keys scope strictly to their own project — a session in
+another project is a 404, never a 403, so a key never learns a different
+project even exists.
+
+**`admin` is the one exception: it is instance-wide, not per-project.**
+`/v1/admin/*` manages every project on the instance — listing all of them,
+minting keys for any of them, deleting any of them — so there is no such
+thing as a project-scoped admin. To keep that honest, the server refuses to
+mint an `admin`-role key for any project other than `default`; use it as
+the one credential that administers the whole instance.
 
 | Role | Can do |
 | --- | --- |
-| `read` | GET routes only |
-| `write` | GETs plus ingest, import, delete |
-| `admin` | Everything, plus `/v1/admin/*` (project and key management) |
+| `read` | GET routes only, within its own project |
+| `write` | GETs plus ingest, import, delete, within its own project |
+| `admin` | Everything, on every project, plus `/v1/admin/*` — instance-wide, `default` project only |
 
 ### Managing keys
 
@@ -108,6 +115,11 @@ npm run keys -w context-trace-server -- create-key <projectId> <name> <read|writ
 npm run keys -w context-trace-server -- list-keys <projectId>
 npm run keys -w context-trace-server -- revoke-key <keyId>
 ```
+
+`create-key ... admin` only succeeds when `<projectId>` is `default` — admin
+is instance-wide (see the role table above), so minting one for any other
+project is refused with a clear error rather than handed out as a
+project-scoped credential that's secretly a superuser.
 
 Set `CT_DB` to point at the instance's database file first if it's not the
 default `./data/context-trace.db`. Inside a Docker deployment, run the
@@ -147,7 +159,19 @@ database, it mints one itself and prints it to stdout once, in a banner you
 can't miss in the logs. Set `CT_ADMIN_KEY` in the environment instead if you
 want to supply your own (useful for containers where you'd rather not scrape
 boot logs) — it's hashed at boot and the operation is idempotent across
-restarts.
+restarts. It must be at least 32 characters; the server refuses to boot with
+a shorter one rather than accept a weak admin secret.
+
+**Prefer supplying `CT_ADMIN_KEY` yourself over the auto-mint path whenever
+you can control the environment before first boot.** The auto-minted key's
+plaintext goes to stdout, and container log drivers (Docker's json-file
+driver included) persist stdout to disk indefinitely — an admin credential
+sitting in a log file is easy to forget about and hard to revoke cleanly.
+`deploy/single-tenant/provision.sh` does exactly this: it generates the
+admin key itself and writes it into the instance's `.env` (mode 0600)
+*before* `docker compose up`, so the auto-mint-and-print path never fires
+for a provision.sh-managed instance — there is exactly one admin key, and
+it never touches a log.
 
 ## Backup and restore
 

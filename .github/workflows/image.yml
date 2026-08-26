@@ -22,8 +22,22 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/${owner}/context-trace-server"
+          tags="${image}:${version}"
+          # Semver prerelease = a hyphen after the numeric core (0.3.0-rc1,
+          # 0.3.0-beta.1). Only a real release may move `latest` — a
+          # pre-release tag must never repoint it.
+          case "$version" in
+            *-*) ;;
+            *) tags="${tags}"$'\n'"${image}:latest" ;;
+          esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<TAGS_EOF"
+            echo "$tags"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
@@ -40,8 +54,6 @@ jobs:
           context: .
           file: server/Dockerfile
           push: true
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/context-trace-server:${{ steps.meta.outputs.version }}
-            ghcr.io/${{ steps.meta.outputs.owner }}/context-trace-server:latest
+          tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

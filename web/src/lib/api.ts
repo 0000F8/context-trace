@@ -34,12 +34,18 @@ export function hasApiKey(): boolean {
   return getApiKey() != null;
 }
 
+// Bumped on every save/clear so an in-flight request can tell whether the key
+// it was sent under is still the current one by the time its response lands.
+// See doFetch's stale-401 guard below.
+let keyEpoch = 0;
+
 export function setApiKey(key: string): void {
   try {
     localStorage.setItem(API_KEY_STORAGE, key);
   } catch {
     // storage unavailable — the key just won't survive a reload.
   }
+  keyEpoch++;
 }
 
 export function clearApiKey(): void {
@@ -48,6 +54,7 @@ export function clearApiKey(): void {
   } catch {
     // storage unavailable — nothing to clear.
   }
+  keyEpoch++;
 }
 
 type UnauthorizedListener = () => void;
@@ -77,13 +84,18 @@ async function parseErrorBody(res: Response, fallback: string): Promise<string> 
 }
 
 async function doFetch(path: string, init?: RequestInit): Promise<Response> {
+  // Captured before the request goes out, so a 401 that was already in
+  // flight when the key changed (a save or a sign-out) can be recognized as
+  // stale once it lands, rather than re-locking the app over a request that
+  // nobody would even retry under the key that's active now.
+  const epoch = keyEpoch;
   let res: Response;
   try {
     res = await fetch(`${BASE}${path}`, { ...init, headers: { ...authHeaders(), ...init?.headers } });
   } catch {
     throw new ApiError('Could not reach the trace server. Is it running?', 0);
   }
-  if (res.status === 401) {
+  if (res.status === 401 && epoch === keyEpoch) {
     // Fires before the caller's own catch runs, so the app can swap in the
     // key prompt instead of (or ahead of) any component's generic error state.
     unauthorizedListeners.forEach((listener) => listener());

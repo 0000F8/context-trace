@@ -12,7 +12,7 @@ import type {
   SegmentWithSections,
   Session,
 } from '@context-trace/types';
-import { openDb } from './db.js';
+import { DEFAULT_PROJECT_ID, openDb } from './db.js';
 import { applySegmentOutcome, endSession, getStats, upsertSegment, upsertSession } from './store.js';
 
 /**
@@ -631,7 +631,7 @@ function seedSession(db: ReturnType<typeof openDb>, plan: SessionPlan, baseTs: n
     metadata: plan.metadata,
     startedAt: new Date(baseTs).toISOString(),
   };
-  upsertSession(db, session);
+  upsertSession(db, session, DEFAULT_PROJECT_ID);
 
   plan.segments.forEach((segPlan, index) => {
     const timestamp = new Date(baseTs + Math.round(stepMs * index)).toISOString();
@@ -646,13 +646,13 @@ function seedSession(db: ReturnType<typeof openDb>, plan: SessionPlan, baseTs: n
       timestamp,
       sections,
     };
-    upsertSegment(db, segment);
-    applySegmentOutcome(db, plan.id, segment.id, buildOutcome(segment.id, index, plan.segments.length));
+    upsertSegment(db, segment, DEFAULT_PROJECT_ID);
+    applySegmentOutcome(db, plan.id, segment.id, buildOutcome(segment.id, index, plan.segments.length), DEFAULT_PROJECT_ID);
   });
 
   if (plan.ended) {
     const lastTs = baseTs + Math.round(stepMs * (plan.segments.length - 1)) + 15_000;
-    endSession(db, plan.id, new Date(lastTs).toISOString());
+    endSession(db, plan.id, new Date(lastTs).toISOString(), DEFAULT_PROJECT_ID);
   }
 }
 
@@ -666,7 +666,7 @@ function main(): void {
   seedSession(db, RESEARCH_ASSISTANT, now - 40 * 60 * 1000);
   seedSession(db, CODE_REVIEW, now - 90 * 60 * 1000);
 
-  const stats = getStats(db);
+  const stats = getStats(db, DEFAULT_PROJECT_ID);
   console.log(
     `Seeded ${SESSION_PLANS.length} sessions into ${dbPath}: ` +
       `${stats.sessions} sessions, ${stats.segments} segments, ${stats.sections} sections, ${stats.totalTokens} tokens.`

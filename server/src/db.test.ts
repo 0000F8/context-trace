@@ -1,11 +1,30 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { fnv1a64 } from '@context-trace/types';
-import { hasFtsSupport, openDb } from './db.js';
+import { DEFAULT_PROJECT_ID, hasFtsSupport, openDb } from './db.js';
 import { upsertSegment, upsertSession } from './store.js';
+
+function resolveTsxBin(): string {
+  const local = join(process.cwd(), 'node_modules', '.bin', 'tsx');
+  if (existsSync(local)) return local;
+  return join(process.cwd(), '..', 'node_modules', '.bin', 'tsx');
+}
+
+/** Runs `tsxBin scriptPath dbPath` and resolves with its exit code + stderr, never rejecting. */
+function runNodeBoot(tsxBin: string, scriptPath: string, dbPath: string): Promise<{ code: number | null; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(tsxBin, [scriptPath, dbPath]);
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('close', (code) => resolve({ code, stderr }));
+  });
+}
 
 describe('openDb', () => {
   it('detects FTS5 support and creates sections_fts on a normal build', () => {
@@ -123,18 +142,22 @@ describe('openDb', () => {
     const path = join(dir, 'heal.db');
     try {
       let db = openDb(path);
-      upsertSession(db, { id: 's1', name: 'sess', startedAt: '2026-01-01T00:00:00.000Z' });
-      upsertSegment(db, {
-        id: 'seg-0',
-        sessionId: 's1',
-        index: 0,
-        kind: 'llm_call',
-        timestamp: '2026-01-01T00:00:00.000Z',
-        sections: [
-          { key: 'a', service: 'svc', serviceKind: 'memory', position: 0, content: 'alpha', contentHash: fnv1a64('alpha'), tokens: 5 },
-          { key: 'b', service: 'svc', serviceKind: 'memory', position: 1, content: 'beta', contentHash: fnv1a64('beta'), tokens: 4 },
-        ],
-      });
+      upsertSession(db, { id: 's1', name: 'sess', startedAt: '2026-01-01T00:00:00.000Z' }, DEFAULT_PROJECT_ID);
+      upsertSegment(
+        db,
+        {
+          id: 'seg-0',
+          sessionId: 's1',
+          index: 0,
+          kind: 'llm_call',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          sections: [
+            { key: 'a', service: 'svc', serviceKind: 'memory', position: 0, content: 'alpha', contentHash: fnv1a64('alpha'), tokens: 5 },
+            { key: 'b', service: 'svc', serviceKind: 'memory', position: 1, content: 'beta', contentHash: fnv1a64('beta'), tokens: 4 },
+          ],
+        },
+        DEFAULT_PROJECT_ID
+      );
 
       const sectionsCount = (db.prepare('SELECT COUNT(*) AS c FROM sections').get() as { c: number }).c;
       expect((db.prepare('SELECT COUNT(*) AS c FROM sections_fts').get() as { c: number }).c).toBe(sectionsCount);
@@ -154,4 +177,63 @@ describe('openDb', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('survives 4 concurrent boots racing the same pre-v0.3 file, instead of crashing on "duplicate column name"', async () => {
+    // Real multi-process concurrency: better-sqlite3 is synchronous, so racing openDb()
+    // calls within a single Node process can never actually interleave — the bug (and the
+    // fix) only shows up across separate connections/processes, exactly like two Docker
+    // Compose instances restarting at once or `npm run keys` running during first boot.
+    const dir = mkdtempSync(join(tmpdir(), 'ct-migration-race-'));
+    const dbPath = join(dir, 'race.db');
+    const scriptPath = join(dir, 'boot.mts');
+    try {
+      // Build the exact pre-v0.3 schema (v0.2 shape) directly, bypassing openDb.
+      const raw = new Database(dbPath);
+      raw.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, agent TEXT, metadata TEXT,
+          started_at TEXT NOT NULL, ended_at TEXT
+        );
+        CREATE TABLE segments (
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, idx INTEGER NOT NULL,
+          label TEXT, kind TEXT NOT NULL, model TEXT, timestamp TEXT NOT NULL, metadata TEXT,
+          outcome TEXT,
+          UNIQUE(session_id, idx)
+        );
+        CREATE TABLE sections (
+          segment_id TEXT NOT NULL, key TEXT NOT NULL, service TEXT NOT NULL,
+          service_kind TEXT NOT NULL, role TEXT, position INTEGER NOT NULL,
+          content TEXT, content_hash TEXT NOT NULL, tokens INTEGER NOT NULL, metadata TEXT,
+          PRIMARY KEY (segment_id, key)
+        );
+      `);
+      raw.close();
+
+      const dbModulePath = JSON.stringify(join(process.cwd(), 'src', 'db.js'));
+      writeFileSync(
+        scriptPath,
+        `import { openDb } from ${dbModulePath};\nopenDb(process.argv[2]).close();\n`
+      );
+
+      const tsxBin = resolveTsxBin();
+      const results = await Promise.all(
+        Array.from({ length: 4 }, () => runNodeBoot(tsxBin, scriptPath, dbPath))
+      );
+
+      for (const r of results) {
+        expect(r.stderr).not.toMatch(/duplicate column name/);
+        expect(r.code).toBe(0);
+      }
+
+      // The DB must end up fully and correctly migrated regardless of who won the race.
+      const db = openDb(dbPath);
+      const cols = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+      expect(cols.some((c) => c.name === 'project_id')).toBe(true);
+      const defaultProject = db.prepare('SELECT 1 FROM projects WHERE id = ?').get(DEFAULT_PROJECT_ID);
+      expect(defaultProject).toBeDefined();
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

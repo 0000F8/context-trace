@@ -34,27 +34,47 @@ Each run:
 1. Creates an isolated Docker Compose project (`ct-<name>`) — its own
    containers, network, and data directory. Provisioning `beta` never
    touches `acme`.
-2. Boots the stack with `CT_AUTH=key`.
-3. Waits for the server's health check.
-4. Mints one admin key, one write key, and one read key by running the
-   `keys` CLI (spec3.md §C) *inside* the server container against its own
-   `/data/context-trace.db` — not from the host. The host and the container
-   see a bind-mounted SQLite file through different filesystem layers under
-   Docker Desktop, and SQLite's WAL locking does not reliably survive that
-   boundary; running the CLI in-container sidesteps it entirely. This was
-   confirmed by testing: the driver-level "bind volume disguised as a named
-   volume" approach failed outright (`SQLITE_CANTOPEN`) and even a working
-   bind mount left writes invisible across the boundary when done from the
-   host process, motivating this design.
-5. Prints all three keys **exactly once**. They are hashed at rest; there is
-   no way to recover them later. Revoke and re-mint if lost.
-6. Writes `instances/<name>/README.md` with the exact `docker compose`
+2. **Generates the admin key itself, locally, before anything boots**, and
+   writes it into the instance's `.env` (mode 0600) as `CT_ADMIN_KEY`. This
+   matters: if the server booted with `CT_AUTH=key` and no `CT_ADMIN_KEY`,
+   it would mint its own bootstrap admin key and print the plaintext to
+   stdout — which Docker's log driver then persists to disk indefinitely,
+   leaving a second, untracked admin credential nobody revokes. Pre-supplying
+   it makes the server take the silent "hash what I was given" path instead
+   (see docs/SELF-HOSTING.md's "Bootstrap admin key" section). There is
+   exactly one admin key per instance, and it lives only in `.env` and in
+   whatever the operator saves from the one-time printout below.
+3. Boots the stack with `CT_AUTH=key` (and the `CT_ADMIN_KEY` from step 2).
+4. Waits for the server's health check.
+5. Mints a write key and a read key by running the `keys` CLI (spec3.md §C)
+   *inside* the server container against its own `/data/context-trace.db` —
+   not from the host. The host and the container see a bind-mounted SQLite
+   file through different filesystem layers under Docker Desktop, and
+   SQLite's WAL locking does not reliably survive that boundary; running the
+   CLI in-container sidesteps it entirely. This was confirmed by testing:
+   the driver-level "bind volume disguised as a named volume" approach
+   failed outright (`SQLITE_CANTOPEN`) and even a working bind mount left
+   writes invisible across the boundary when done from the host process,
+   motivating this design.
+6. Prints all three keys **once**. The write and read keys are hashed at
+   rest with no way to recover the plaintext later — revoke and re-mint if
+   lost. The admin key is different: it's intentionally recoverable from
+   `.env` (`grep CT_ADMIN_KEY instances/<name>/.env`), since the server
+   needs the plaintext again on every restart to re-verify against its hash.
+7. Writes `instances/<name>/README.md` with the exact `docker compose`
    invocations (with the right `-f`/`--env-file`/`-p` flags baked in) for
    status, logs, stop, upgrade, minting more keys, and backup.
+8. Writes a completion marker (`instances/<name>/.provisioned`) once all of
+   the above has succeeded.
 
-Re-running against an existing instance (its `.env` already exists) never
-reprovisions or mints new keys — it reports current container status and
-reminds you how to mint additional keys if you need them.
+Idempotency is gated on that completion marker, not on `.env` existing:
+`.env` is written early (the stack needs it to boot) but the marker is
+written last, so a run that dies partway through — stack up, keys not yet
+minted — is resumed and completed on retry (minting a fresh set of
+write/read keys) instead of being mistaken for a successful, fully-keyed
+instance. Once the marker exists, re-running reports current container
+status and reminds you how to mint additional keys if you need them,
+without touching anything.
 
 ## Operating an instance
 
@@ -88,9 +108,10 @@ migrations are guarded and run automatically at boot.
 
 **Teardown** — `docker compose ... down -v` removes the containers, network,
 and named volume; `rm -rf instances/<name>` removes the provisioning
-artifacts (`.env`, generated README). The bind-mounted `data/` directory
-holding the actual database is not touched by `down -v` — remove it
-explicitly if you want the data gone too.
+artifacts (`.env` — including the instance's admin key, since that's where
+it lives long-term — and the generated README). The bind-mounted `data/`
+directory holding the actual database is not touched by `down -v` — remove
+it explicitly if you want the data gone too.
 
 ## The honest scaling ceiling
 
@@ -103,8 +124,10 @@ one instance to grow indefinitely. See
 ## Notes
 
 - `instances/` is created on first use and is git-ignored — it holds
-  secrets (`.env`, mode 0600) and per-instance data, neither of which
-  belongs in version control.
-- `provision.sh` requires `docker` and the `docker compose` v2 plugin.
-  Nothing else — key minting happens inside the container, not via a
-  host-side Node/npm install.
+  secrets (`.env`, mode 0600, including the live admin key) and per-instance
+  data, neither of which belongs in version control.
+- `provision.sh` requires `docker`, the `docker compose` v2 plugin, and
+  either `openssl` or a readable `/dev/urandom` (used to generate the admin
+  key locally, before boot — see step 2 above). Nothing else: the write and
+  read keys are minted inside the container, not via a host-side Node/npm
+  install.

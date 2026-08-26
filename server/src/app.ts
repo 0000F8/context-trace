@@ -367,6 +367,19 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
 
   app.get('/healthz', (c) => c.json({ ok: true }));
 
+  // CORS applies only to the ingest endpoint (including its OPTIONS preflight) — the SPA
+  // is same-origin via proxy and read/delete routes never need it. Registered BEFORE the
+  // /v1/* auth resolver below: Hono composes middleware in registration order, and CORS's
+  // OPTIONS handling short-circuits with its own 204 without calling `next()`. If the
+  // auth resolver ran first, a preflight (which by definition can't carry x-api-key) would
+  // 401 before CORS ever got a chance to answer it, and the browser would block the real
+  // request without ever sending it — this was exactly v0.2's working behavior, broken by
+  // adding the resolver ahead of it. Registering CORS first also means its
+  // Access-Control-Allow-Origin header (set on the shared `c.res` before `next()` runs)
+  // survives a downstream 401, so an auth failure surfaces as a readable response instead
+  // of an opaque CORS error.
+  app.use('/v1/ingest', cors({ origin: opts.corsOrigin ?? '*' }));
+
   // Resolves { projectId, role } for every /v1/* request and stashes it on the context.
   // In 'none' mode (open, or legacy write-key mode) everything resolves to the default
   // project with full access — `requireApiKey` below is what actually gates writes there,
@@ -447,10 +460,6 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     }
     await next();
   };
-
-  // CORS applies only to the ingest endpoint (including its OPTIONS preflight) —
-  // the SPA is same-origin via proxy and read/delete routes never need it.
-  app.use('/v1/ingest', cors({ origin: opts.corsOrigin ?? '*' }));
 
   app.post(
     '/v1/ingest',
@@ -677,7 +686,15 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   // Admin surface (spec3.md §C): self-host key management. `requireAdminRole` 404s the
   // entire subtree outside 'key' mode, so an open local instance exposes no key
   // management at all; `adminRateLimit` caps it to 10 req/min per admin key.
-  app.use('/v1/admin/*', requireAdminRole, adminRateLimit);
+  app.use(
+    '/v1/admin/*',
+    requireAdminRole,
+    adminRateLimit,
+    bodyLimit({
+      maxSize: MAX_BODY_BYTES,
+      onError: (c) => c.json({ error: 'payload too large' }, 413),
+    })
+  );
 
   app.post('/v1/admin/projects', async (c) => {
     let body: unknown;
@@ -711,7 +728,12 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     if (typeof body.role !== 'string' || !KEY_ROLES.has(body.role)) {
       return c.json({ error: 'role must be one of read, write, admin' }, 400);
     }
-    const created = store.createProjectKey(db, projectId, body.name, body.role as KeyRole);
+    let created;
+    try {
+      created = store.createProjectKey(db, projectId, body.name, body.role as KeyRole);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : 'invalid request' }, 400);
+    }
     if (!created) return c.json({ error: 'not found' }, 404);
     return c.json(created, 201);
   });
@@ -729,7 +751,12 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   });
 
   app.delete('/v1/admin/projects/:id', (c) => {
-    const deleted = store.deleteProject(db, c.req.param('id'));
+    let deleted;
+    try {
+      deleted = store.deleteProject(db, c.req.param('id'));
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : 'invalid request' }, 400);
+    }
     if (!deleted) return c.json({ error: 'not found' }, 404);
     return c.json({ ok: true });
   });

@@ -235,6 +235,30 @@ function sanitizeOption(value: number | undefined, fallback: number, min: number
   return Math.floor(value);
 }
 
+/**
+ * Validate a `contentMode`. Unlike `sanitizeOption` above, an unrecognized
+ * value here does NOT fall back to a default — it throws. `contentMode` is
+ * a privacy control: silently normalizing a typo (or a bad value from
+ * config/JS callers with no type checking) to `'full'` would ship content
+ * the caller believed was being withheld, with no signal that anything
+ * went wrong. Fail closed instead: refuse to construct a client, or open a
+ * segment, with an unrecognized mode. `undefined` is a distinct case (means
+ * "not overridden, use the fallback/default") and is handled by the caller
+ * before this function is reached — it is never passed in as `value` here.
+ *
+ * Accepts `'hash_only'` (underscore) as an alias for `'hash-only'` in
+ * addition to erroring on genuinely unknown values, since the Python SDK's
+ * canonical spelling is `'hash_only'` and this is the one cross-language
+ * footgun worth closing outright rather than just documenting.
+ */
+function normalizeContentMode(value: string, context: string): ContentMode {
+  if (value === 'full') return 'full';
+  if (value === 'hash-only' || value === 'hash_only') return 'hash-only';
+  throw new Error(
+    `context-trace: invalid contentMode ${JSON.stringify(value)} (${context}); expected 'full' or 'hash-only'`,
+  );
+}
+
 export class ClientImpl implements Client {
   private readonly endpoint: string;
   private readonly apiKey: string | undefined;
@@ -275,7 +299,10 @@ export class ClientImpl implements Client {
     this.maxSessions = sanitizeOption(options.maxSessions, DEFAULT_MAX_SESSIONS, 1);
     this.onErrorCb = options.onError;
     this.enabled = options.enabled ?? true;
-    this.defaultContentMode = options.contentMode === 'hash-only' ? 'hash-only' : 'full';
+    this.defaultContentMode =
+      options.contentMode === undefined
+        ? 'full'
+        : normalizeContentMode(options.contentMode, 'ClientOptions.contentMode');
     this.defaultRedact = options.redact;
 
     if (this.enabled && this.flushIntervalMs > 0) {
@@ -529,13 +556,15 @@ class SessionHandleImpl implements SessionHandle {
     const timestamp = options.timestamp ?? new Date().toISOString();
     // Per-segment override wins in both directions: an explicit
     // contentMode/redact on this call replaces the client default entirely
-    // for this segment, rather than merging with it.
+    // for this segment, rather than merging with it. An unrecognized
+    // contentMode throws here (see normalizeContentMode) rather than
+    // silently downgrading this segment to 'full' — this is a deliberate
+    // exception to segment()'s usual non-throwing contract, since silently
+    // widening a privacy control is worse than a loud failure.
     const contentMode: ContentMode =
       options.contentMode === undefined
         ? this.client.defaultContentMode
-        : options.contentMode === 'hash-only'
-          ? 'hash-only'
-          : 'full';
+        : normalizeContentMode(options.contentMode, "session.segment({ contentMode })");
     const redact = options.redact === undefined ? this.client.defaultRedact : options.redact;
     return new SegmentBuilderImpl(
       this.client,

@@ -648,6 +648,32 @@ class TestRedact(ClientTestCase):
         recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
         self.assertEqual(recorded["data"]["sections"][0]["content"], "plain")
 
+    def test_redact_replaces_rather_than_merges_omitted_content_is_dropped(self):
+        # Regression for a fail-open bug: a redactor that returns a dict
+        # WITHOUT a "content" key must drop the content entirely, not fall
+        # back to the pre-redaction original. This mirrors the TS SDK,
+        # where the returned SectionInput IS the section going forward.
+        def redact(section):
+            return {
+                "key": section["key"],
+                "service": section["service"],
+                "service_kind": section["service_kind"],
+            }
+
+        ct = self.make_client(redact=redact)
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="sk-live-DEADBEEF-super-secret")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        section = recorded["data"]["sections"][0]
+        self.assertNotIn("content", section)
+        self.assertFalse(
+            any("sk-live-DEADBEEF-super-secret" in str(v) for v in section.values())
+        )
+
 
 class TestHashOnlyOutcome(ClientTestCase):
     def test_hash_only_omits_response_text_but_keeps_other_fields(self):
@@ -710,6 +736,59 @@ class TestHashOnlyOutcome(ClientTestCase):
 
         outcomes = [e for e in self.server.all_events() if e["type"] == "segment.outcome"]
         self.assertEqual(outcomes[0]["data"]["outcome"]["responseText"], "should ship")
+
+
+class TestContentModeValidation(ClientTestCase):
+    """
+    Regression coverage for a fail-open bug: an unrecognized content_mode
+    used to silently normalize to "full" instead of raising, so a typo
+    (e.g. the TS SDK's own spelling, "hash-only") shipped full content with
+    no warning at all. content_mode is a privacy control — it must fail
+    closed (raise) rather than fail open (silently widen).
+    """
+
+    def test_unrecognized_client_level_content_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self.make_client(content_mode="redacted")
+
+    def test_unrecognized_per_segment_content_mode_raises(self):
+        ct = self.make_client(content_mode="hash_only")
+        session = ct.start_session(name="s")
+        with self.assertRaises(ValueError):
+            session.segment(content_mode="hush_only")  # plausible typo of "hash_only"
+
+    def test_the_ts_sdk_spelling_hash_dash_only_raises_would_be_wrong_it_must_be_accepted(self):
+        # This is the exact bug from the report: "hash-only" (the TS SDK's
+        # and spec3.md's canonical spelling) must work in Python too,
+        # rather than silently falling back to full content.
+        ct = self.make_client(content_mode="hash-only")
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="secret")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        self.assertNotIn("content", recorded["data"]["sections"][0])
+
+    def test_hash_dash_only_spelling_accepted_as_per_segment_override_too(self):
+        ct = self.make_client()  # client default: full
+        session = ct.start_session(name="s")
+        seg = session.segment(content_mode="hash-only")
+        seg.section(key="a", service="svc", content="secret")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        self.assertNotIn("content", recorded["data"]["sections"][0])
+
+    def test_valid_content_modes_never_raise_regression(self):
+        ct = self.make_client(content_mode="full")
+        session = ct.start_session(name="s")
+        session.segment(content_mode="full")
+        session.segment(content_mode="hash_only")
+        ct2 = self.make_client()  # omitted entirely: defaults to "full", must not raise
+        ct2.session("s").segment()
 
 
 if __name__ == "__main__":

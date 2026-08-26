@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { fnv1a64 } from '@context-trace/types';
 import type { SegmentWithSections } from '@context-trace/types';
-import { openDb, type Db } from './db.js';
+import { DEFAULT_PROJECT_ID, openDb, type Db } from './db.js';
 import { getSessionSummary, upsertSegment } from './store.js';
 
 function section(key: string, content: string) {
@@ -33,11 +33,11 @@ describe('upsertSegment stub-session rollback', () => {
       sections: [section('dup', 'first'), section('dup', 'second')],
     };
 
-    expect(() => upsertSegment(db, segment)).toThrow();
+    expect(() => upsertSegment(db, segment, DEFAULT_PROJECT_ID)).toThrow();
 
     // The stub session ensureStubSession would have created must not have survived the
     // rollback — getSessionSummary must report the session as not found.
-    expect(getSessionSummary(db, 'ghost-session')).toBeUndefined();
+    expect(getSessionSummary(db, 'ghost-session', DEFAULT_PROJECT_ID)).toBeUndefined();
   });
 
   it('still creates the stub session when the upsert actually succeeds', () => {
@@ -51,9 +51,9 @@ describe('upsertSegment stub-session rollback', () => {
       sections: [section('a', 'ok')],
     };
 
-    upsertSegment(db, segment);
+    upsertSegment(db, segment, DEFAULT_PROJECT_ID);
 
-    const summary = getSessionSummary(db, 'ghost-session');
+    const summary = getSessionSummary(db, 'ghost-session', DEFAULT_PROJECT_ID);
     expect(summary).toBeDefined();
     expect(summary?.segmentCount).toBe(1);
   });
