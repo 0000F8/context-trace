@@ -158,9 +158,27 @@ through an API would leak part of a secret we didn't generate. It means the
 env admin key's prefix won't resemble the key you set; match it by the
 `env-admin-key` name instead.
 
-Admin routes are rate-limited (10 requests/minute/key) and don't exist at
-all outside `key` mode — an open local instance exposes no key management
-surface (`/v1/admin/*` 404s).
+Admin routes are rate-limited (10 requests/minute/key by default) and
+don't exist at all outside `key` mode — an open local instance exposes no
+key management surface (`/v1/admin/*` 404s).
+
+The default (`CT_ADMIN_RATE_LIMIT=10`, `CT_ADMIN_RATE_WINDOW_MS=60000`)
+suits a human operator clicking through the admin API by hand. It does not
+suit automation: any script (or a hosted control plane) that provisions
+projects uses one admin key for everything, and creating a project plus a
+key for it alone costs 3 admin calls — at the default window that's a hard
+ceiling of **3 provisioned projects per minute, platform-wide, per admin
+key**. If you're scripting provisioning, raise both:
+
+```sh
+CT_ADMIN_RATE_LIMIT=200 CT_ADMIN_RATE_WINDOW_MS=60000
+```
+
+Both are validated at boot the same way `CT_AUTH` and `CT_ADMIN_KEY` are —
+anything other than a positive integer fails fast with a clear error rather
+than silently falling back to the default. When a caller does trip the
+limit, the `429` response carries a `Retry-After` header (seconds until the
+window resets) so it can back off intelligently instead of guessing.
 
 ### Bootstrap admin key
 

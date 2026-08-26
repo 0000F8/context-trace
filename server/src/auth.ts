@@ -19,6 +19,21 @@ export function parseAuthMode(raw: string | undefined): AuthMode {
   throw new Error(`invalid CT_AUTH value: ${JSON.stringify(raw)} (expected unset, "none", or "key")`);
 }
 
+/**
+ * Parses an env var expected to be a positive integer (e.g. CT_ADMIN_RATE_LIMIT,
+ * CT_ADMIN_RATE_WINDOW_MS), falling back to `fallback` when unset/empty. Fails fast on
+ * anything else — 0, negative, decimal, non-numeric — the same posture as `parseAuthMode`:
+ * garbage config should stop boot with a clear message, not silently coerce to something
+ * unintended (`Number('')` is 0, `Number('abc')` is NaN, both easy to get wrong silently).
+ */
+export function parsePositiveIntEnv(raw: string | undefined, envName: string, fallback: number): number {
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
+    throw new Error(`invalid ${envName} value: ${JSON.stringify(raw)} (expected a positive integer)`);
+  }
+  return Number(raw);
+}
+
 export interface ResolvedKey {
   keyId: string;
   projectId: string;

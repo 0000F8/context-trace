@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Hono } from 'hono';
-import { bootstrapAuth, parseAuthMode } from './auth.js';
+import { bootstrapAuth, parseAuthMode, parsePositiveIntEnv } from './auth.js';
 import { createApp } from './app.js';
 import { DEFAULT_PROJECT_ID, openDb, type Db } from './db.js';
 import { hashKey } from './keys.js';
@@ -53,6 +53,27 @@ describe('parseAuthMode', () => {
     expect(() => parseAuthMode('open')).toThrow(/invalid CT_AUTH/);
     expect(() => parseAuthMode('KEY')).toThrow(/invalid CT_AUTH/);
     expect(() => parseAuthMode('true')).toThrow(/invalid CT_AUTH/);
+  });
+});
+
+describe('parsePositiveIntEnv (CT_ADMIN_RATE_LIMIT / CT_ADMIN_RATE_WINDOW_MS)', () => {
+  it('falls back to the default when unset or empty', () => {
+    expect(parsePositiveIntEnv(undefined, 'CT_X', 10)).toBe(10);
+    expect(parsePositiveIntEnv('', 'CT_X', 10)).toBe(10);
+  });
+
+  it('parses a valid positive integer', () => {
+    expect(parsePositiveIntEnv('25', 'CT_X', 10)).toBe(25);
+    expect(parsePositiveIntEnv('1', 'CT_X', 10)).toBe(1);
+  });
+
+  it('fails fast on garbage rather than silently coercing (0, negative, decimal, non-numeric)', () => {
+    expect(() => parsePositiveIntEnv('0', 'CT_X', 10)).toThrow(/invalid CT_X/);
+    expect(() => parsePositiveIntEnv('-5', 'CT_X', 10)).toThrow(/invalid CT_X/);
+    expect(() => parsePositiveIntEnv('3.5', 'CT_X', 10)).toThrow(/invalid CT_X/);
+    expect(() => parsePositiveIntEnv('abc', 'CT_X', 10)).toThrow(/invalid CT_X/);
+    expect(() => parsePositiveIntEnv(' 5', 'CT_X', 10)).toThrow(/invalid CT_X/);
+    expect(() => parsePositiveIntEnv('5 ', 'CT_X', 10)).toThrow(/invalid CT_X/);
   });
 });
 
@@ -652,14 +673,59 @@ describe('admin routes (spec3.md §C)', () => {
     expect(store.sessionExists(db, 'doomed-session', project.id)).toBe(false);
   });
 
-  it('rate-limits admin traffic to 10 requests/minute/key', async () => {
+  it('rate-limits admin traffic to 10 requests/minute/key by default, and the 429 carries a sane Retry-After', async () => {
     const statuses: number[] = [];
+    let tripped: Response | undefined;
     for (let i = 0; i < 11; i++) {
       const res = await app.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } });
       statuses.push(res.status);
+      if (res.status === 429) tripped = res;
     }
     expect(statuses.slice(0, 10)).toEqual(Array(10).fill(200));
     expect(statuses[10]).toBe(429);
+
+    // Retry-After lets an automated caller back off intelligently instead of guessing —
+    // it must be present, numeric, and within the (default 60s) window, not 0 or absent.
+    const retryAfter = Number(tripped?.headers.get('retry-after'));
+    expect(Number.isFinite(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+  });
+
+  it('honors a configured admin rate limit higher than the default, permitting more calls', async () => {
+    const raisedApp = createApp(db, { authMode: 'key', adminRateLimit: 20, adminRateWindowMs: 60_000 });
+    const statuses: number[] = [];
+    for (let i = 0; i < 21; i++) {
+      const res = await raisedApp.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } });
+      statuses.push(res.status);
+    }
+    expect(statuses.slice(0, 20)).toEqual(Array(20).fill(200));
+    expect(statuses[20]).toBe(429);
+  });
+
+  it('honors a configured admin rate window: a shorter window resets sooner', async () => {
+    vi.useFakeTimers();
+    try {
+      const shortWindowApp = createApp(db, { authMode: 'key', adminRateLimit: 2, adminRateWindowMs: 1_000 });
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      expect((await shortWindowApp.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } })).status).toBe(
+        200
+      );
+      expect((await shortWindowApp.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } })).status).toBe(
+        200
+      );
+      const tripped = await shortWindowApp.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } });
+      expect(tripped.status).toBe(429);
+      expect(Number(tripped.headers.get('retry-after'))).toBeLessThanOrEqual(1);
+
+      // Past the 1s window, the count resets — the same key can act again immediately.
+      vi.setSystemTime(new Date('2026-01-01T00:00:01.100Z'));
+      expect((await shortWindowApp.request(`${baseUrl()}/v1/admin/projects`, { headers: { 'x-api-key': adminKey } })).status).toBe(
+        200
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('refuses to mint an admin key for any project other than default (admin is instance-wide, not per-project)', async () => {

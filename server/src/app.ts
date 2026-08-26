@@ -46,8 +46,13 @@ const SECTION_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 const EVENT_TYPES = new Set(['session.started', 'segment.recorded', 'session.ended', 'segment.outcome']);
 const KEY_ROLES = new Set(['read', 'write', 'admin']);
 
-const ADMIN_RATE_LIMIT = 10;
-const ADMIN_RATE_WINDOW_MS = 60_000;
+// Defaults suit a human operator using the admin API by hand. An automated consumer
+// (a hosted control plane, a self-hoster scripting provisioning) uses one admin key for
+// everything, and creating a project + its keys alone costs 3 admin calls — at the
+// default window that's a hard ceiling of 3 provisioned projects/minute/admin key.
+// Overridable via CT_ADMIN_RATE_LIMIT / CT_ADMIN_RATE_WINDOW_MS (see index.ts).
+const DEFAULT_ADMIN_RATE_LIMIT = 10;
+const DEFAULT_ADMIN_RATE_WINDOW_MS = 60_000;
 /** Throttle for `last_used_at` writes: at most one UPDATE per key per this window. */
 const LAST_USED_TOUCH_MS = 60_000;
 
@@ -60,6 +65,10 @@ export interface AppOptions {
    * /v1/* route (spec3.md §A).
    */
   authMode?: AuthMode;
+  /** Max admin-route requests per window, per admin key. Default 10 (CT_ADMIN_RATE_LIMIT). */
+  adminRateLimit?: number;
+  /** Admin-route rate limit window, in ms. Default 60_000 (CT_ADMIN_RATE_WINDOW_MS). */
+  adminRateWindowMs?: number;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -358,10 +367,13 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   busRegistry.set(app, bus);
   const ftsAvailable = hasFtsSupport(db);
   const authMode: AuthMode = opts.authMode ?? 'none';
+  const adminRateLimitMax = opts.adminRateLimit ?? DEFAULT_ADMIN_RATE_LIMIT;
+  const adminRateWindowMs = opts.adminRateWindowMs ?? DEFAULT_ADMIN_RATE_WINDOW_MS;
 
   // In-memory only (spec3.md §B/§C): throttles last_used_at writes to ~once/minute/key,
-  // and caps admin-route traffic to 10 req/min/key. Both are per-app-instance state,
-  // same lifetime as `bus` above — fine since there is no multi-process fan-out here.
+  // and caps admin-route traffic (default 10 req/min/key, configurable — see AppOptions).
+  // Both are per-app-instance state, same lifetime as `bus` above — fine since there is
+  // no multi-process fan-out here.
   const lastTouch = new Map<string, number>();
   const adminHits = new Map<string, { count: number; resetAt: number }>();
 
@@ -452,8 +464,11 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     const now = Date.now();
     const entry = adminHits.get(keyId);
     if (!entry || now >= entry.resetAt) {
-      adminHits.set(keyId, { count: 1, resetAt: now + ADMIN_RATE_WINDOW_MS });
-    } else if (entry.count >= ADMIN_RATE_LIMIT) {
+      adminHits.set(keyId, { count: 1, resetAt: now + adminRateWindowMs });
+    } else if (entry.count >= adminRateLimitMax) {
+      // Lets an automated caller back off intelligently instead of guessing or busy-polling.
+      const retryAfterSeconds = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      c.header('Retry-After', String(retryAfterSeconds));
       return c.json({ error: 'rate limit exceeded' }, 429);
     } else {
       entry.count++;
