@@ -273,6 +273,52 @@ export interface SessionExport {
 }
 
 // ---------------------------------------------------------------------------
+// Tenancy (v0.3) — present in every edition; only enforced when CT_AUTH=key
+// ---------------------------------------------------------------------------
+
+/**
+ * Auth posture of a server.
+ * - 'none': open (or legacy write-key mode when CT_API_KEY is set) — the
+ *   local/self-host default, byte-identical to v0.2 behavior.
+ * - 'key': project-scoped keys required on every /v1 route.
+ */
+export type AuthMode = 'none' | 'key';
+
+export type KeyRole = 'read' | 'write' | 'admin';
+
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+/** Key metadata. The plaintext key is returned exactly once, at creation. */
+export interface ProjectKeyInfo {
+  id: string;
+  projectId: string;
+  name: string;
+  role: KeyRole;
+  /** Leading characters of the plaintext, for identification in listings. */
+  prefix: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
+}
+
+/** Only ever returned by the create-key endpoint. */
+export interface CreatedProjectKey extends ProjectKeyInfo {
+  key: string;
+}
+
+/**
+ * How much of a section's payload leaves the host process.
+ * - 'full': content ships (default).
+ * - 'hash-only': content is withheld; contentHash and tokens still ship, so
+ *   composition, diffs, spans, and analytics all work without exposing text.
+ */
+export type ContentMode = 'full' | 'hash-only';
+
+// ---------------------------------------------------------------------------
 // Pure utilities
 // ---------------------------------------------------------------------------
 
