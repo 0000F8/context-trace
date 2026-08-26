@@ -1,7 +1,11 @@
-import { estimateTokens, fnv1a64 } from '@context-trace/types';
+import { estimateTokens, fnv1a64, generateId } from '@context-trace/types';
 import type {
   AnnotatedSection,
   CompiledTrace,
+  CreatedProjectKey,
+  KeyRole,
+  Project,
+  ProjectKeyInfo,
   Section,
   SectionState,
   Segment,
@@ -19,9 +23,12 @@ import type {
   Stats,
 } from '@context-trace/types';
 import type { Db } from './db.js';
-import { hasFtsSupport } from './db.js';
+import { DEFAULT_PROJECT_ID, hasFtsSupport } from './db.js';
+import { hashKey, mintKey } from './keys.js';
 import { compileTrace, deltaCounts, diffSections } from './trace/compile.js';
 import type { TraceSourceSegment } from './trace/compile.js';
+
+export { DEFAULT_PROJECT_ID };
 
 interface SessionRow {
   id: string;
@@ -125,10 +132,28 @@ function sectionMetaRowToSection(row: SectionMetaRow): Section {
 // Writes
 // ---------------------------------------------------------------------------
 
-export function upsertSession(db: Db, session: Session): void {
+/**
+ * Looks up a session's owning project without loading the rest of the row — used by
+ * every write path below to reject a cross-project write the same way v0.2 rejects a
+ * cross-session import: as an "unknown session", never a leak of which other project
+ * actually owns the id. Session ids stay globally unique (the PK is unchanged), so a
+ * second project can never silently take over an id that belongs to another one.
+ */
+function getSessionProjectId(db: Db, sessionId: string): string | undefined {
+  const row = db.prepare('SELECT project_id FROM sessions WHERE id = ?').get(sessionId) as
+    | { project_id: string }
+    | undefined;
+  return row?.project_id;
+}
+
+export function upsertSession(db: Db, session: Session, projectId: string = DEFAULT_PROJECT_ID): void {
+  const existingProjectId = getSessionProjectId(db, session.id);
+  if (existingProjectId !== undefined && existingProjectId !== projectId) {
+    throw new Error('unknown session');
+  }
   db.prepare(
-    `INSERT INTO sessions (id, name, agent, metadata, started_at, ended_at)
-     VALUES (@id, @name, @agent, @metadata, @started_at, @ended_at)
+    `INSERT INTO sessions (id, name, agent, metadata, started_at, ended_at, project_id)
+     VALUES (@id, @name, @agent, @metadata, @started_at, @ended_at, @project_id)
      ON CONFLICT(id) DO UPDATE SET
        name = excluded.name,
        agent = excluded.agent,
@@ -142,19 +167,23 @@ export function upsertSession(db: Db, session: Session): void {
     metadata: session.metadata ? JSON.stringify(session.metadata) : null,
     started_at: session.startedAt,
     ended_at: session.endedAt ?? null,
+    project_id: projectId,
   });
 }
 
-export function ensureStubSession(db: Db, sessionId: string, timestamp: string): void {
-  const exists = db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(sessionId);
-  if (exists) return;
+export function ensureStubSession(db: Db, sessionId: string, timestamp: string, projectId: string = DEFAULT_PROJECT_ID): void {
+  const existingProjectId = getSessionProjectId(db, sessionId);
+  if (existingProjectId !== undefined) {
+    if (existingProjectId !== projectId) throw new Error('unknown session');
+    return;
+  }
   db.prepare(
-    `INSERT INTO sessions (id, name, agent, metadata, started_at, ended_at)
-     VALUES (?, ?, NULL, NULL, ?, NULL)`
-  ).run(sessionId, `stub-${sessionId}`, timestamp);
+    `INSERT INTO sessions (id, name, agent, metadata, started_at, ended_at, project_id)
+     VALUES (?, ?, NULL, NULL, ?, NULL, ?)`
+  ).run(sessionId, `stub-${sessionId}`, timestamp, projectId);
 }
 
-export function upsertSegment(db: Db, segment: SegmentWithSections): void {
+export function upsertSegment(db: Db, segment: SegmentWithSections, projectId: string = DEFAULT_PROJECT_ID): void {
   const upsertSegmentStmt = db.prepare(
     `INSERT INTO segments (id, session_id, idx, label, kind, model, timestamp, metadata)
      VALUES (@id, @session_id, @idx, @label, @kind, @model, @timestamp, @metadata)
@@ -186,7 +215,7 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
     // Inside the transaction: if anything below throws (e.g. a constraint violation),
     // the stub-session insert rolls back too, instead of leaving a phantom empty session
     // behind for a segment that was ultimately rejected.
-    ensureStubSession(db, seg.sessionId, seg.timestamp);
+    ensureStubSession(db, seg.sessionId, seg.timestamp, projectId);
     upsertSegmentStmt.run({
       id: seg.id,
       session_id: seg.sessionId,
@@ -246,35 +275,57 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
  * under that session — the caller (app.ts) turns that into a per-event rejection
  * rather than silently no-op-ing or fabricating a segment.
  */
-export function applySegmentOutcome(db: Db, sessionId: string, segmentId: string, outcome: SegmentOutcome): boolean {
+export function applySegmentOutcome(
+  db: Db,
+  sessionId: string,
+  segmentId: string,
+  outcome: SegmentOutcome,
+  projectId: string = DEFAULT_PROJECT_ID
+): boolean {
   const result = db
-    .prepare('UPDATE segments SET outcome = ? WHERE id = ? AND session_id = ?')
-    .run(JSON.stringify(outcome), segmentId, sessionId);
+    .prepare(
+      `UPDATE segments SET outcome = ? WHERE id = ? AND session_id = ?
+       AND session_id IN (SELECT id FROM sessions WHERE project_id = ?)`
+    )
+    .run(JSON.stringify(outcome), segmentId, sessionId, projectId);
   return result.changes > 0;
 }
 
 /** Looks up a segment's index by id, scoped to a session — used to shape live `outcome` events. */
-export function getSegmentIndexById(db: Db, sessionId: string, segmentId: string): number | undefined {
-  const row = db.prepare('SELECT idx FROM segments WHERE id = ? AND session_id = ?').get(segmentId, sessionId) as
-    | { idx: number }
-    | undefined;
+export function getSegmentIndexById(
+  db: Db,
+  sessionId: string,
+  segmentId: string,
+  projectId: string = DEFAULT_PROJECT_ID
+): number | undefined {
+  const row = db
+    .prepare(
+      `SELECT idx FROM segments WHERE id = ? AND session_id = ?
+       AND session_id IN (SELECT id FROM sessions WHERE project_id = ?)`
+    )
+    .get(segmentId, sessionId, projectId) as { idx: number } | undefined;
   return row?.idx;
 }
 
 /**
  * Ends an existing session. Unlike segment.recorded, this never fabricates a stub session:
- * an unknown sessionId is a no-op, returning false so callers can reject the event instead
- * of silently creating (or resurrecting a just-deleted) session from an end event alone.
+ * an unknown sessionId (or one owned by a different project) is a no-op, returning false so
+ * callers can reject the event instead of silently creating (or resurrecting a just-deleted)
+ * session from an end event alone.
  */
-export function endSession(db: Db, sessionId: string, endedAt: string): boolean {
-  const result = db.prepare('UPDATE sessions SET ended_at = ? WHERE id = ?').run(endedAt, sessionId);
+export function endSession(db: Db, sessionId: string, endedAt: string, projectId: string = DEFAULT_PROJECT_ID): boolean {
+  const result = db
+    .prepare('UPDATE sessions SET ended_at = ? WHERE id = ? AND project_id = ?')
+    .run(endedAt, sessionId, projectId);
   return result.changes > 0;
 }
 
-export function deleteSession(db: Db, id: string): boolean {
+export function deleteSession(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): boolean {
   // sections_fts is a virtual table: the sessions/segments/sections FK cascade
   // (ON DELETE CASCADE) never reaches it, so it needs its own explicit cleanup.
   const tx = db.transaction((sessionId: string) => {
+    const owned = db.prepare('SELECT 1 FROM sessions WHERE id = ? AND project_id = ?').get(sessionId, projectId);
+    if (!owned) return { changes: 0 };
     if (hasFtsSupport(db)) {
       db.prepare(
         `DELETE FROM sections_fts WHERE segment_id IN (SELECT id FROM segments WHERE session_id = ?)`
@@ -385,32 +436,60 @@ function buildSessionSummary(db: Db, row: SessionRow): SessionSummary {
   };
 }
 
-export function sessionExists(db: Db, id: string): boolean {
-  return Boolean(db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(id));
+export function sessionExists(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): boolean {
+  return Boolean(db.prepare('SELECT 1 FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId));
 }
 
-export function getSessionSummary(db: Db, id: string): SessionSummary | undefined {
-  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
+export function getSessionSummary(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): SessionSummary | undefined {
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId) as
+    | SessionRow
+    | undefined;
   if (!row) return undefined;
   return buildSessionSummary(db, row);
 }
 
-export function getStats(db: Db): Stats {
-  const sessions = (db.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c;
-  const segments = (db.prepare('SELECT COUNT(*) AS c FROM segments').get() as { c: number }).c;
-  const sections = (db.prepare('SELECT COUNT(*) AS c FROM sections').get() as { c: number }).c;
-  const totalTokens = (db.prepare('SELECT COALESCE(SUM(tokens), 0) AS t FROM sections').get() as { t: number }).t;
+export function getStats(db: Db, projectId: string = DEFAULT_PROJECT_ID): Stats {
+  const sessions = (
+    db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE project_id = ?').get(projectId) as { c: number }
+  ).c;
+  const segments = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM segments seg JOIN sessions s ON s.id = seg.session_id WHERE s.project_id = ?`
+      )
+      .get(projectId) as { c: number }
+  ).c;
+  const sections = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM sections sec
+         JOIN segments seg ON seg.id = sec.segment_id
+         JOIN sessions s ON s.id = seg.session_id
+         WHERE s.project_id = ?`
+      )
+      .get(projectId) as { c: number }
+  ).c;
+  const totalTokens = (
+    db
+      .prepare(
+        `SELECT COALESCE(SUM(sec.tokens), 0) AS t FROM sections sec
+         JOIN segments seg ON seg.id = sec.segment_id
+         JOIN sessions s ON s.id = seg.session_id
+         WHERE s.project_id = ?`
+      )
+      .get(projectId) as { t: number }
+  ).t;
   const lastRow = db
     .prepare(
       `SELECT MAX(ts) AS last FROM (
-         SELECT timestamp AS ts FROM segments
+         SELECT seg.timestamp AS ts FROM segments seg JOIN sessions s ON s.id = seg.session_id WHERE s.project_id = ?
          UNION ALL
-         SELECT started_at AS ts FROM sessions
+         SELECT started_at AS ts FROM sessions WHERE project_id = ?
          UNION ALL
-         SELECT ended_at AS ts FROM sessions WHERE ended_at IS NOT NULL
+         SELECT ended_at AS ts FROM sessions WHERE project_id = ? AND ended_at IS NOT NULL
        )`
     )
-    .get() as { last: string | null };
+    .get(projectId, projectId, projectId) as { last: string | null };
 
   return {
     sessions,
@@ -425,10 +504,12 @@ export interface ListSessionsOptions {
   limit: number;
   offset: number;
   q?: string;
+  projectId?: string;
 }
 
 export function listSessions(db: Db, opts: ListSessionsOptions): { sessions: SessionSummary[]; total: number } {
   const q = opts.q?.trim();
+  const projectId = opts.projectId ?? DEFAULT_PROJECT_ID;
   let rows: SessionRow[];
   let total: number;
 
@@ -436,28 +517,34 @@ export function listSessions(db: Db, opts: ListSessionsOptions): { sessions: Ses
     const like = `%${q.toLowerCase()}%`;
     total = (
       db
-        .prepare(`SELECT COUNT(*) AS c FROM sessions WHERE lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?`)
-        .get(like, like) as { c: number }
+        .prepare(
+          `SELECT COUNT(*) AS c FROM sessions
+           WHERE project_id = ? AND (lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?)`
+        )
+        .get(projectId, like, like) as { c: number }
     ).c;
     rows = db
       .prepare(
-        `SELECT * FROM sessions WHERE lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?
+        `SELECT * FROM sessions
+         WHERE project_id = ? AND (lower(name) LIKE ? OR lower(COALESCE(agent, '')) LIKE ?)
          ORDER BY started_at DESC LIMIT ? OFFSET ?`
       )
-      .all(like, like, opts.limit, opts.offset) as SessionRow[];
+      .all(projectId, like, like, opts.limit, opts.offset) as SessionRow[];
   } else {
-    total = (db.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c;
+    total = (db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE project_id = ?').get(projectId) as { c: number }).c;
     rows = db
-      .prepare('SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?')
-      .all(opts.limit, opts.offset) as SessionRow[];
+      .prepare('SELECT * FROM sessions WHERE project_id = ? ORDER BY started_at DESC LIMIT ? OFFSET ?')
+      .all(projectId, opts.limit, opts.offset) as SessionRow[];
   }
 
   const sessions = rows.map((row) => buildSessionSummary(db, row));
   return { sessions, total };
 }
 
-export function getSessionDetail(db: Db, id: string): SessionDetail | undefined {
-  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
+export function getSessionDetail(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): SessionDetail | undefined {
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId) as
+    | SessionRow
+    | undefined;
   if (!row) return undefined;
 
   const summary = buildSessionSummary(db, row);
@@ -487,8 +574,8 @@ export function getSessionDetail(db: Db, id: string): SessionDetail | undefined 
   return { ...summary, segments: segmentSummaries };
 }
 
-export function getSessionTrace(db: Db, id: string): CompiledTrace | undefined {
-  const summary = getSessionSummary(db, id);
+export function getSessionTrace(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): CompiledTrace | undefined {
+  const summary = getSessionSummary(db, id, projectId);
   if (!summary) return undefined;
   // The compiled trace never surfaces section content (ops/spans/services are all
   // key/token/hash based), so compile from the lightweight, content-free load.
@@ -496,9 +583,14 @@ export function getSessionTrace(db: Db, id: string): CompiledTrace | undefined {
   return compileTrace(summary, segments);
 }
 
-export function getSegmentDetail(db: Db, sessionId: string, index: number): SegmentDetail | undefined {
-  const sessionExists = db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(sessionId);
-  if (!sessionExists) return undefined;
+export function getSegmentDetail(
+  db: Db,
+  sessionId: string,
+  index: number,
+  projectId: string = DEFAULT_PROJECT_ID
+): SegmentDetail | undefined {
+  const sessionOwned = db.prepare('SELECT 1 FROM sessions WHERE id = ? AND project_id = ?').get(sessionId, projectId);
+  if (!sessionOwned) return undefined;
 
   const segRow = db.prepare('SELECT * FROM segments WHERE session_id = ? AND idx = ?').get(sessionId, index) as
     | SegmentRow
@@ -562,6 +654,7 @@ export function getSegmentDetail(db: Db, sessionId: string, index: number): Segm
 export interface SearchOptions {
   q: string;
   limit: number;
+  projectId?: string;
 }
 
 // Snippet highlight markers, pinned to control chars U+0001/U+0002 (not literal '[' /
@@ -581,6 +674,7 @@ export const SNIPPET_MARK_CLOSE = String.fromCharCode(2);
  */
 export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
   const phrase = `"${opts.q.replace(/"/g, '""')}"`;
+  const projectId = opts.projectId ?? DEFAULT_PROJECT_ID;
   const rows = db
     .prepare(
       `SELECT f.session_id AS session_id, s.name AS session_name, f.segment_index AS segment_index,
@@ -588,11 +682,11 @@ export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
               snippet(sections_fts, 0, '${SNIPPET_MARK_OPEN}', '${SNIPPET_MARK_CLOSE}', '…', 12) AS snippet
        FROM sections_fts f
        JOIN sessions s ON s.id = f.session_id
-       WHERE sections_fts MATCH ?
+       WHERE sections_fts MATCH ? AND s.project_id = ?
        ORDER BY rank
        LIMIT ?`
     )
-    .all(phrase, opts.limit) as Array<{
+    .all(phrase, projectId, opts.limit) as Array<{
     session_id: string;
     session_name: string;
     segment_index: number;
@@ -615,8 +709,10 @@ export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
 // Export
 // ---------------------------------------------------------------------------
 
-export function exportSession(db: Db, id: string): SessionExport | undefined {
-  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
+export function exportSession(db: Db, id: string, projectId: string = DEFAULT_PROJECT_ID): SessionExport | undefined {
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ? AND project_id = ?').get(id, projectId) as
+    | SessionRow
+    | undefined;
   if (!row) return undefined;
 
   const session = sessionRowToSession(row);
@@ -638,4 +734,155 @@ export function exportSession(db: Db, id: string): SessionExport | undefined {
   });
 
   return { version: 1, exportedAt: new Date().toISOString(), session, segments };
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy: projects + project keys (v0.3, spec3.md §B/§C)
+// ---------------------------------------------------------------------------
+
+interface ProjectRow {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
+function projectRowToProject(row: ProjectRow): Project {
+  return { id: row.id, name: row.name, createdAt: row.created_at };
+}
+
+export function createProject(db: Db, name: string): Project {
+  const id = generateId('proj');
+  const createdAt = new Date().toISOString();
+  db.prepare('INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)').run(id, name, createdAt);
+  return { id, name, createdAt };
+}
+
+export function listProjects(db: Db): Project[] {
+  return (db.prepare('SELECT * FROM projects ORDER BY created_at ASC').all() as ProjectRow[]).map(projectRowToProject);
+}
+
+export function getProject(db: Db, id: string): Project | undefined {
+  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as ProjectRow | undefined;
+  return row ? projectRowToProject(row) : undefined;
+}
+
+/**
+ * Deletes a project and cascades to its keys (via the `project_keys` FK) and its
+ * sessions. `sessions.project_id` has no FK to `projects` (spec3.md §B), so the
+ * sessions themselves are deleted explicitly here — which then cascades to their
+ * segments/sections via the existing FK, with the same manual sections_fts cleanup
+ * `deleteSession` needs for the same reason (FTS is a virtual table, outside FK cascade).
+ */
+export function deleteProject(db: Db, id: string): boolean {
+  const tx = db.transaction((projectId: string) => {
+    const sessionIds = (
+      db.prepare('SELECT id FROM sessions WHERE project_id = ?').all(projectId) as Array<{ id: string }>
+    ).map((r) => r.id);
+    if (sessionIds.length > 0) {
+      const placeholders = sessionIds.map(() => '?').join(',');
+      if (hasFtsSupport(db)) {
+        db.prepare(
+          `DELETE FROM sections_fts WHERE segment_id IN (SELECT id FROM segments WHERE session_id IN (${placeholders}))`
+        ).run(...sessionIds);
+      }
+      db.prepare(`DELETE FROM sessions WHERE id IN (${placeholders})`).run(...sessionIds);
+    }
+    return db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
+  });
+  const result = tx(id);
+  return result.changes > 0;
+}
+
+interface ProjectKeyRow {
+  id: string;
+  project_id: string;
+  name: string;
+  role: string;
+  key_hash: string;
+  prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+function keyRowToInfo(row: ProjectKeyRow): ProjectKeyInfo {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    role: row.role as KeyRole,
+    prefix: row.prefix,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at ?? undefined,
+    revokedAt: row.revoked_at ?? undefined,
+  };
+}
+
+/** Mints and persists a new key for `projectId`. Returns undefined if the project doesn't exist. */
+export function createProjectKey(db: Db, projectId: string, name: string, role: KeyRole): CreatedProjectKey | undefined {
+  if (!getProject(db, projectId)) return undefined;
+  const minted = mintKey(role);
+  const id = generateId('key');
+  const createdAt = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO project_keys (id, project_id, name, role, key_hash, prefix, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, projectId, name, role, minted.hash, minted.prefix, createdAt);
+  return { id, projectId, name, role, prefix: minted.prefix, createdAt, key: minted.plaintext };
+}
+
+/** Metadata only — never the hash or plaintext. */
+export function listProjectKeys(db: Db, projectId: string): ProjectKeyInfo[] {
+  return (
+    db.prepare('SELECT * FROM project_keys WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as ProjectKeyRow[]
+  ).map(keyRowToInfo);
+}
+
+/** Sets `revoked_at`; a no-op (returns false) if the key doesn't exist or is already revoked. */
+export function revokeProjectKey(db: Db, keyId: string): boolean {
+  const result = db
+    .prepare(`UPDATE project_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
+    .run(new Date().toISOString(), keyId);
+  return result.changes > 0;
+}
+
+/** Looks up an active (non-revoked) key by its sha256 hash — the auth hot path. */
+export function findActiveKeyByHash(
+  db: Db,
+  hash: string
+): { id: string; projectId: string; role: KeyRole; keyHash: string } | undefined {
+  const row = db
+    .prepare('SELECT id, project_id, role, key_hash FROM project_keys WHERE key_hash = ? AND revoked_at IS NULL')
+    .get(hash) as { id: string; project_id: string; role: string; key_hash: string } | undefined;
+  return row ? { id: row.id, projectId: row.project_id, role: row.role as KeyRole, keyHash: row.key_hash } : undefined;
+}
+
+export function hasActiveAdminKey(db: Db): boolean {
+  return Boolean(db.prepare(`SELECT 1 FROM project_keys WHERE role = 'admin' AND revoked_at IS NULL LIMIT 1`).get());
+}
+
+/** Inserts a freshly-minted bootstrap admin key under the default project. */
+export function insertBootstrapAdminKey(db: Db, minted: { hash: string; prefix: string }): void {
+  const id = generateId('key');
+  db.prepare(
+    `INSERT INTO project_keys (id, project_id, name, role, key_hash, prefix, created_at)
+     VALUES (?, ?, 'bootstrap-admin', 'admin', ?, ?, ?)`
+  ).run(id, DEFAULT_PROJECT_ID, minted.hash, minted.prefix, new Date().toISOString());
+}
+
+/** Hashes `plaintext` (from CT_ADMIN_KEY) and stores it if not already present — idempotent across restarts. */
+export function ensureAdminKeyFromEnv(db: Db, plaintext: string): void {
+  const hash = hashKey(plaintext);
+  const existing = db.prepare('SELECT 1 FROM project_keys WHERE key_hash = ?').get(hash);
+  if (existing) return;
+  const id = generateId('key');
+  db.prepare(
+    `INSERT INTO project_keys (id, project_id, name, role, key_hash, prefix, created_at)
+     VALUES (?, ?, 'env-admin-key', 'admin', ?, ?, ?)`
+  ).run(id, DEFAULT_PROJECT_ID, hash, plaintext.slice(0, 12), new Date().toISOString());
+}
+
+/** Updates `last_used_at`; callers throttle this to at most once/minute/key themselves. */
+export function touchKeyLastUsed(db: Db, keyId: string): void {
+  db.prepare('UPDATE project_keys SET last_used_at = ? WHERE id = ?').run(new Date().toISOString(), keyId);
 }

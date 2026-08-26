@@ -174,13 +174,29 @@
   border-top: 1px solid var(--line);
 }
 
-.left-rail__export a {
+.left-rail__export-button {
   font-size: var(--text-dense);
+  color: var(--focus);
+  background: none;
+  border: none;
+  padding: 0;
   text-decoration: none;
 }
 
-.left-rail__export a:hover {
+.left-rail__export-button:hover:not(:disabled) {
   text-decoration: underline;
+}
+
+.left-rail__export-button:disabled {
+  color: var(--ink-2);
+  cursor: default;
+}
+
+.left-rail__export-error {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--service-4);
 }
 
 @media (max-width: 900px) {

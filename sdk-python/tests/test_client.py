@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from context_trace import ContextTraceClient
+from context_trace import ContextTraceClient, fnv1a64, estimate_tokens
 from mock_server import MockIngestServer
 
 
@@ -503,6 +503,213 @@ class TestEndpointSchemeValidation(ClientTestCase):
         ct_http.shutdown()
         ct_https = self.make_client(endpoint="https://example.com")
         ct_https.shutdown()
+
+
+class TestContentModes(ClientTestCase):
+    def test_full_mode_ships_content_unchanged(self):
+        ct = self.make_client()
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="hello world")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        section = recorded["data"]["sections"][0]
+        self.assertEqual(section["content"], "hello world")
+        self.assertEqual(section["contentHash"], fnv1a64("hello world"))
+        self.assertEqual(section["tokens"], estimate_tokens("hello world"))
+
+    def test_hash_only_omits_content_but_preserves_hash_and_tokens(self):
+        ct = self.make_client(content_mode="hash_only")
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="hello world", tokens=7)
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        section = recorded["data"]["sections"][0]
+        self.assertNotIn("content", section)
+        self.assertEqual(section["contentHash"], fnv1a64("hello world"))
+        self.assertEqual(section["tokens"], 7)
+
+    def test_per_segment_override_wins_client_full_segment_hash_only(self):
+        ct = self.make_client()  # client default: full
+        session = ct.start_session(name="s")
+        seg = session.segment(content_mode="hash_only")
+        seg.section(key="a", service="svc", content="secret")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        section = recorded["data"]["sections"][0]
+        self.assertNotIn("content", section)
+        self.assertEqual(section["contentHash"], fnv1a64("secret"))
+
+    def test_per_segment_override_wins_client_hash_only_segment_full(self):
+        ct = self.make_client(content_mode="hash_only")
+        session = ct.start_session(name="s")
+        seg = session.segment(content_mode="full")
+        seg.section(key="a", service="svc", content="visible")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        section = recorded["data"]["sections"][0]
+        self.assertEqual(section["content"], "visible")
+
+
+class TestRedact(ClientTestCase):
+    def test_redact_rewrites_content_before_hashing(self):
+        def redact(section):
+            section = dict(section)
+            section["content"] = (section["content"] or "").replace("SECRET", "[REDACTED]")
+            return section
+
+        ct = self.make_client(redact=redact)
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="my SECRET value")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        section = recorded["data"]["sections"][0]
+        self.assertEqual(section["content"], "my [REDACTED] value")
+        self.assertEqual(section["contentHash"], fnv1a64("my [REDACTED] value"))
+        self.assertNotEqual(section["contentHash"], fnv1a64("my SECRET value"))
+
+    def test_redact_returning_none_drops_section_and_keeps_positions_contiguous(self):
+        def redact(section):
+            return None if section["key"] == "drop-me" else section
+
+        ct = self.make_client(redact=redact)
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="first", service="svc", content="a")
+        seg.section(key="drop-me", service="svc", content="b")
+        seg.section(key="third", service="svc", content="c")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        sections = recorded["data"]["sections"]
+        self.assertEqual([(s["key"], s["position"]) for s in sections], [("first", 0), ("third", 1)])
+
+    def test_redact_raising_drops_section_and_reports_fail_closed(self):
+        def redact(section):
+            if section["key"] == "boom":
+                raise RuntimeError("redactor exploded")
+            return section
+
+        ct = self.make_client(redact=redact)
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="ok", service="svc", content="fine")
+        seg.section(key="boom", service="svc", content="top secret payload")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        sections = recorded["data"]["sections"]
+        self.assertEqual([s["key"] for s in sections], ["ok"])
+        # No content from the dropped section ever reached the (mock) wire.
+        self.assertFalse(any("top secret payload" in str(s) for s in sections))
+        self.assertTrue(any("redactor exploded" in str(e) for e in self.errors))
+
+    def test_per_segment_redact_override_wins_over_client_default(self):
+        def client_redact(section):
+            raise AssertionError("client-level redact should never run for this segment")
+
+        def segment_redact(section):
+            section = dict(section)
+            section["content"] = "overridden"
+            return section
+
+        ct = self.make_client(redact=client_redact)
+        session = ct.start_session(name="s")
+        seg = session.segment(redact=segment_redact)
+        seg.section(key="a", service="svc", content="original")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        self.assertEqual(recorded["data"]["sections"][0]["content"], "overridden")
+
+    def test_no_redact_leaves_content_untouched(self):
+        ct = self.make_client()
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="plain")
+        seg.record()
+        ct.flush()
+
+        recorded = [e for e in self.server.all_events() if e["type"] == "segment.recorded"][0]
+        self.assertEqual(recorded["data"]["sections"][0]["content"], "plain")
+
+
+class TestHashOnlyOutcome(ClientTestCase):
+    def test_hash_only_omits_response_text_but_keeps_other_fields(self):
+        ct = self.make_client(content_mode="hash_only")
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="x")
+        seg.record()
+        seg.outcome(
+            response_text="sensitive model output",
+            latency_ms=842,
+            model="claude-sonnet-5",
+            scores={"helpfulness": 0.9},
+            error="timeout",
+        )
+        ct.flush()
+
+        outcomes = [e for e in self.server.all_events() if e["type"] == "segment.outcome"]
+        data = outcomes[0]["data"]["outcome"]
+        self.assertNotIn("responseText", data)
+        self.assertEqual(data["latencyMs"], 842)
+        self.assertEqual(data["model"], "claude-sonnet-5")
+        self.assertEqual(data["scores"]["helpfulness"], 0.9)
+        self.assertEqual(data["error"], "timeout")
+
+    def test_full_mode_still_sends_response_text(self):
+        ct = self.make_client()
+        session = ct.start_session(name="s")
+        seg = session.segment()
+        seg.section(key="a", service="svc", content="x")
+        seg.record()
+        seg.outcome(response_text="visible model output")
+        ct.flush()
+
+        outcomes = [e for e in self.server.all_events() if e["type"] == "segment.outcome"]
+        self.assertEqual(outcomes[0]["data"]["outcome"]["responseText"], "visible model output")
+
+    def test_per_segment_hash_only_override_applies_to_that_segments_outcome(self):
+        ct = self.make_client()  # client default: full
+        session = ct.start_session(name="s")
+        seg = session.segment(content_mode="hash_only")
+        seg.section(key="a", service="svc", content="x")
+        seg.record()
+        seg.outcome(response_text="should be withheld", latency_ms=10)
+        ct.flush()
+
+        outcomes = [e for e in self.server.all_events() if e["type"] == "segment.outcome"]
+        data = outcomes[0]["data"]["outcome"]
+        self.assertNotIn("responseText", data)
+        self.assertEqual(data["latencyMs"], 10)
+
+    def test_per_segment_full_override_applies_to_that_segments_outcome(self):
+        ct = self.make_client(content_mode="hash_only")
+        session = ct.start_session(name="s")
+        seg = session.segment(content_mode="full")
+        seg.section(key="a", service="svc", content="x")
+        seg.record()
+        seg.outcome(response_text="should ship")
+        ct.flush()
+
+        outcomes = [e for e in self.server.all_events() if e["type"] == "segment.outcome"]
+        self.assertEqual(outcomes[0]["data"]["outcome"]["responseText"], "should ship")
 
 
 if __name__ == "__main__":

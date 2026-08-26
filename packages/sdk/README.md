@@ -50,6 +50,8 @@ await ct.flush();      // drain queue (also on timer); ct.shutdown() = flush + s
 | `maxSessions`     | `number?`                | `1000`    | Max distinct session ids kept in the `startSession`/`session` handle cache (see `ct.session(id)` below). On overflow, the **least-recently-used** session id is evicted. |
 | `onError`         | `(err: Error) => void`   | -         | Called for dropped events, exhausted retries, and idempotency warnings (e.g. double `record()`). Never throws — an error thrown from your handler is swallowed. |
 | `enabled`         | `boolean?`               | `true`    | When `false`, every capture call is a complete no-op: nothing is queued, no timer starts, `fetch` is never called. |
+| `contentMode`     | `'full' \| 'hash-only'`  | `'full'`  | See [Privacy modes](#privacy-modes) below. Overridable per segment via `session.segment({ contentMode })`. |
+| `redact`          | `(section: SectionInput) => SectionInput \| null` | -   | See [Privacy modes](#privacy-modes) below. Overridable per segment via `session.segment({ redact })`. |
 
 ## API
 
@@ -65,9 +67,9 @@ await ct.flush();      // drain queue (also on timer); ct.shutdown() = flush + s
   - `input: { key, service, serviceKind, role?, content?, tokens?, metadata? }` — `contentHash` is computed from `content ?? ''` immediately. `tokens` defaults to `estimateTokens(content ?? '')` when omitted.
   - Section `position` is **not** set here — it's assigned at `record()` time from call order (arrival order), so it's stable even under interleaved async calls.
 - `segment.record()` — finalizes the segment (assigns positions, computes the snapshot) and enqueues `segment.recorded`. **Idempotent**: a second call on the same builder is a no-op that reports a warning via `onError` instead of throwing. If two `section()` calls used the same `key`, the last one wins (its content replaces the earlier one in the same ordinal slot) and a warning is reported via `onError` — the server rejects a segment snapshot outright if it contains a duplicate key, so the SDK resolves it client-side first.
-- `segment.outcome(o)` — attaches a model-call result (`{ responseText?, latencyMs?, model?, scores?, error? }`) to this segment and enqueues `segment.outcome`. Valid **only after** `record()`: the server correlates by segment id, which doesn't exist until the segment snapshot has been enqueued. Calling it before `record()` reports a warning via `onError` and enqueues nothing — it does not queue and retry later.
+- `segment.outcome(o)` — attaches a model-call result (`{ responseText?, latencyMs?, model?, scores?, error? }`) to this segment and enqueues `segment.outcome`. Valid **only after** `record()`: the server correlates by segment id, which doesn't exist until the segment snapshot has been enqueued. Calling it before `record()` reports a warning via `onError` and enqueues nothing — it does not queue and retry later. When this segment's effective `contentMode` is `'hash-only'`, `responseText` is omitted from the wire payload the same way section content is — see [Privacy modes](#privacy-modes).
 - `session.end(endedAt?)` — enqueues `session.ended`.
-- `session.outcome(segmentId, o)` — attaches a model-call result to a segment **by id**, for stateless hook contexts that only have a session id and segment id to correlate against (e.g. an `handleLLMEnd`-style callback that didn't keep the originating `SegmentBuilder` in memory, or a hook that runs in a separate process/invocation from the one that recorded the segment). Enqueues the same `segment.outcome` event as `segment.outcome(o)` above — there is no ordering requirement against the matching `segment.recorded` beyond what the server enforces (rejected with `'unknown segment'` if the segment id doesn't exist yet when the event is applied).
+- `session.outcome(segmentId, o)` — attaches a model-call result to a segment **by id**, for stateless hook contexts that only have a session id and segment id to correlate against (e.g. an `handleLLMEnd`-style callback that didn't keep the originating `SegmentBuilder` in memory, or a hook that runs in a separate process/invocation from the one that recorded the segment). Enqueues the same `segment.outcome` event as `segment.outcome(o)` above — there is no ordering requirement against the matching `segment.recorded` beyond what the server enforces (rejected with `'unknown segment'` if the segment id doesn't exist yet when the event is applied). Same `responseText` withholding in `hash-only` mode, but note this by-id form has no segment builder in hand and so always uses the **client-level** `contentMode`, never a per-segment override — see [Privacy modes](#privacy-modes).
 - `ct.flush()` — `Promise<void>`. Drains the queue, sending batches of up to `maxBatch` events. Concurrent calls share one in-flight drain. Never rejects — network failures are retried and eventually dropped internally (see below).
 - `ct.shutdown()` — `Promise<void>`. Stops the background timer, then flushes.
 
@@ -84,6 +86,105 @@ Only `flush()` and `shutdown()` return promises. Everything else (`startSession`
 - **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`.
 - **Browser lifecycle flush**: in browsers, hiding or unloading the page triggers an immediate keepalive flush of everything queued (see "Using from a browser"). In Node this path is inert.
 - **`enabled: false`**: turns the client into a complete no-op — useful for disabling tracing in tests or specific environments without changing call sites.
+
+## Privacy modes
+
+By default the SDK ships full section content to the server (`contentMode:
+'full'`). If you'd rather run composition analytics — diffs, spans, churn,
+thrash, dead-weight, over-window findings — **without** the underlying prompt
+text ever leaving your process, set `contentMode: 'hash-only'` on the client,
+per segment, or both.
+
+```ts
+const ct = createClient({
+  endpoint: 'http://localhost:4720',
+  contentMode: 'hash-only', // every section, on every segment, by default
+});
+
+// Opt one specific segment back into full content:
+const seg = session.segment({ kind: 'llm_call', contentMode: 'full' });
+```
+
+| | `full` (default) | `hash-only` |
+| --- | --- | --- |
+| Section `content` | Sent | **Not sent** — omitted from the wire payload entirely |
+| `contentHash` (fnv1a-64 of the real content) | Sent | Sent |
+| `tokens` | Sent | Sent |
+| Section `key`, `service`, `serviceKind`, `role` | Sent | Sent |
+| Session/segment metadata (`label`, `kind`, `model`, timestamps) | Sent | Sent |
+| `SegmentOutcome.latencyMs`, `.model`, `.scores`, `.error` | Sent | Sent |
+| `SegmentOutcome.responseText` | Sent | **Not sent** — same treatment as section content |
+
+**What `hash-only` guarantees:**
+
+- `section.content` is omitted from the wire payload entirely (not sent as
+  an empty string — the field is absent). It never leaves this process.
+- `contentHash` (an `fnv1a64` hash) and `tokens` are still computed and
+  shipped, from the real content, so the server can compile diffs, spans,
+  token budgets, and every analytics finding exactly as it would in full
+  mode — see spec §D and the server's hash-only compile test.
+- `SegmentOutcome.responseText` is model output — exactly as sensitive as
+  section content — and is withheld the same way: omitted from the wire
+  payload for every `segment.outcome()`/`session.outcome(segmentId, ...)`
+  call made while the effective `contentMode` for that segment is
+  `'hash-only'`. `latencyMs`, `model`, and `scores` are metadata, not
+  content, and always ship in both modes.
+
+**What it does NOT guarantee:**
+
+- Section **`key` and `service` still ship** in both modes. They're
+  identifiers meant to be stable and human-legible (e.g. `'mem:user-profile'`,
+  `'retrieval'`), not payload — don't put secrets, PII, or literal user
+  content in them.
+- `metadata` on a section or segment is **not** covered by `contentMode` and
+  ships as-is in both modes. If it can carry sensitive data in your
+  integration, redact it yourself (see below) or don't populate it.
+- `SegmentOutcome.error` is **not** withheld in either mode. Provider error
+  messages can embed secrets (an API key echoed back, a raw request body in
+  an SDK exception) — scrub it yourself before calling `outcome({ error })`
+  if that's a concern; the SDK has no way to know what a given provider's
+  error strings contain.
+- `session.outcome(segmentId, o)` — the stateless, by-id correlation form —
+  has no segment builder in hand, so it can't see a per-segment `contentMode`
+  override made on the original `segment(...)` call. It always strips
+  `responseText` according to the **client-level** `contentMode`, never a
+  per-segment override. If you rely on a per-segment override for a segment
+  you also close out via `session.outcome(segmentId, ...)`, hold the
+  `SegmentBuilder` and call `segment.outcome(...)` on it directly instead.
+
+**The `redact` callback** runs on every section, in both modes, *before*
+hashing and *before* content-mode stripping — so a rewrite changes
+`contentHash` too (the hash always reflects what the redactor decided the
+"real" content is, not the original). Order is: `redact` → hash → strip.
+
+```ts
+const ct = createClient({
+  endpoint: 'http://localhost:4720',
+  redact(section) {
+    if (section.service !== 'user-input') return section;
+    return { ...section, content: scrubPII(section.content ?? '') };
+  },
+});
+```
+
+- Return the section unchanged (or a rewritten copy) to keep it.
+- Return `null` to drop the section entirely — it never reaches the queue,
+  and later sections in the same segment keep contiguous `position`s
+  starting from 0 (no gap where the dropped section would have been).
+- **Fails closed.** If `redact` throws, the SDK reports the error via
+  `onError` and drops the section — it never falls back to shipping the
+  original, unredacted content just because your scrubbing logic broke. If
+  you need best-effort redaction that ships *something* rather than
+  dropping, catch your own exceptions inside the callback and return a safe
+  fallback (e.g. `{ ...section, content: '[redaction failed]' }`) instead of
+  letting them propagate.
+
+Both `contentMode` and `redact` are overridable per segment via
+`session.segment({ contentMode, redact })` — an explicit value there
+replaces the client-level default for that one segment snapshot (it doesn't
+merge with it), in either direction: a `hash-only` client can opt one
+sensitive segment into `full`, and a `full` client can opt one segment into
+`hash-only`.
 
 ## Runtime
 

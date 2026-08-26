@@ -33,6 +33,20 @@ docker compose up -d --build && docker compose run --rm seed   # full stack on :
 - **Docker** builds run from the repo root context (`docker build -f server/Dockerfile .`) because workspaces need the root lockfile. The compose `seed` service runs `server/dist/seed.js` against the shared `/data` volume. nginx has a dedicated SSE location for `/api/v1/sessions/*/live` (buffering off) — keep it ahead of the generic `/api/` block.
 - **v0.2 surfaces**: analytics is pure (`server/src/trace/analytics.ts`, thresholds are named constants there); the SSE bus emits after successful ingest apply; FTS5 (`sections_fts`) is maintained manually inside store transactions with a boot backfill — user queries must stay phrase-quoted bound parameters; `POST /v1/import` is a write (auth-gated like ingest). The Python SDK (`sdk-python/`, stdlib-only, `python3 -m unittest discover -s sdk-python/tests`) must keep `fnv1a64` bit-identical to the TS implementation — it hashes UTF-16 code units to match `charCodeAt`.
 
+## Editions boundary (v0.3)
+
+This repo is the **open core**; hosted-only capability belongs in a separate
+control plane that wraps it, never a patch to these files. `docs/EDITIONS.md` is
+the public contract — if you add a feature, check which column it belongs in,
+and never degrade the OSS path to favor a hosted one. The OSS server makes no
+outbound network calls; keep it that way.
+
+Auth has three postures and the compatibility table in `.omc/autopilot/spec3.md`
+§A is load-bearing: `CT_AUTH` unset behaves exactly as v0.2 (open, or write-key
+when `CT_API_KEY` is set); only `CT_AUTH=key` turns on project scoping. Upgrades
+must never silently tighten reads. Project scoping is enforced in the **store
+layer**, and a session in another project must be a 404, never a 403.
+
 ## Conventions
 
 - TS strict + `noUncheckedIndexedAccess` + `verbatimModuleSyntax` (use `import type`); everything ESM with NodeNext resolution — except `web/`, which uses bundler resolution and does not extend the root tsconfig.

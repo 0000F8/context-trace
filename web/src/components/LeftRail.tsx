@@ -1,7 +1,20 @@
+import { useState } from 'react';
 import type { Finding, SessionAnalytics, SessionSummary, TraceService } from '@context-trace/types';
-import { exportUrl } from '../lib/api';
+import { fetchExport } from '../lib/api';
 import { formatDateTime, formatPercent, formatTokens } from '../lib/format';
 import './LeftRail.css';
+
+/** Triggers a browser download of `blob` named `filename` via a throwaway object URL. */
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
 interface LeftRailProps {
   session: SessionSummary;
@@ -26,6 +39,22 @@ export function LeftRail({
 }: LeftRailProps) {
   const byName = new Map(services.map((s) => [s.name, s]));
   const ordered = serviceOrder.map((name) => byName.get(name)).filter((s): s is TraceService => s != null);
+
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  async function handleExport() {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const { blob, filename } = await fetchExport(session.id);
+      downloadBlob(blob, filename);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : 'Export failed.');
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <aside className="left-rail">
@@ -115,9 +144,10 @@ export function LeftRail({
         </div>
       )}
       <div className="left-rail__export">
-        <a href={exportUrl(session.id)} download>
-          Export session
-        </a>
+        <button type="button" className="left-rail__export-button" onClick={handleExport} disabled={exporting}>
+          {exporting ? 'Exporting…' : 'Export session'}
+        </button>
+        {exportError && <span className="left-rail__export-error">{exportError}</span>}
       </div>
     </aside>
   );

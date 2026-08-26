@@ -118,6 +118,18 @@ The handler implements: `name`, `handleChainStart`, `handleChainEnd`,
   still ships, just without an explicit `session.started` event or a
   human-chosen session name.
 
+## Privacy modes
+
+The handler has no privacy API of its own — it inherits whatever
+`contentMode` and `redact` the `client` you pass to it was configured with
+(see the [SDK README's Privacy modes section](../sdk/README.md#privacy-modes)).
+Every `segment.section(...)` call this handler makes goes through the same
+client, so a client created with `contentMode: 'hash-only'` (or a `redact`
+callback) applies uniformly to every session/segment/section this handler
+records — prompts, chat messages, and model outputs alike. There is no
+separate `ContextTraceCallbackHandler` option to set a content mode or
+redactor; configure it once on `createClient(...)` instead.
+
 ## Tools
 
 `handleToolStart`/`handleToolEnd` are implemented as **no-ops**. Tool calls

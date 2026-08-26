@@ -9,6 +9,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "seed": "tsx src/seed.ts",
+    "keys": "tsx src/keys-cli.ts",
     "test": "vitest run"
   },
   "dependencies": {

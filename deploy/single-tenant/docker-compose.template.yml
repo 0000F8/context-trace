@@ -1,0 +1,44 @@
+# Single-tenant instance template for context-trace.
+#
+# Not meant to be run directly — `provision.sh` renders an instance-specific
+# .env next to a copy of this file and drives `docker compose` against both.
+# Parameters (supplied via --env-file):
+#   CT_INSTANCE   instance name, used only for labeling
+#   CT_WEB_PORT   host port the web UI is published on (default 8080)
+#   CT_DATA_DIR   host directory backing the SQLite data volume
+#   CT_AUTH       auth posture — single-tenant instances always use `key`
+#
+# Build context is the repo root (../.. relative to this file) because both
+# Dockerfiles need the root lockfile and every workspace's package.json —
+# same requirement as the top-level docker-compose.yml.
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    environment:
+      CT_AUTH: ${CT_AUTH:-key}
+    volumes:
+      # A plain bind mount, not a named volume: SQLite's WAL mode needs real
+      # POSIX locking, which breaks under Docker Desktop's local-volume-driver
+      # bind trick (`driver_opts: {type: none, o: bind}`) — that goes through
+      # an extra virtiofs/osxfs hop that silently corrupts SQLite's shared-
+      # memory locking (confirmed by testing: SQLITE_CANTOPEN). A native bind
+      # mount does not have that problem, on macOS or Linux.
+      - ${CT_DATA_DIR}:/data
+    restart: unless-stopped
+    labels:
+      - "com.context-trace.instance=${CT_INSTANCE}"
+
+  web:
+    build:
+      context: ../..
+      dockerfile: web/Dockerfile
+    ports:
+      - "${CT_WEB_PORT:-8080}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      - "com.context-trace.instance=${CT_INSTANCE}"

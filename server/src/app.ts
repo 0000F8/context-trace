@@ -1,15 +1,24 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
-import type { MiddlewareHandler } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
-import type { IngestEvent, IngestResponse, SegmentOutcome, SegmentWithSections, Session } from '@context-trace/types';
+import type {
+  AuthMode,
+  IngestEvent,
+  IngestResponse,
+  KeyRole,
+  SegmentOutcome,
+  SegmentWithSections,
+  Session,
+} from '@context-trace/types';
 import type { Db } from './db.js';
 import { hasFtsSupport } from './db.js';
 import * as store from './store.js';
 import { SessionBus } from './bus.js';
 import { computeAnalytics } from './trace/analytics.js';
+import { resolveApiKey } from './auth.js';
+import { constantTimeEqual } from './keys.js';
 
 const MAX_BATCH = 500;
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
@@ -35,17 +44,22 @@ const SESSION_KINDS = new Set(['llm_call', 'turn', 'custom']);
 const SERVICE_KINDS = new Set(['system', 'memory', 'retrieval', 'tool', 'history', 'user', 'other']);
 const SECTION_ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 const EVENT_TYPES = new Set(['session.started', 'segment.recorded', 'session.ended', 'segment.outcome']);
+const KEY_ROLES = new Set(['read', 'write', 'admin']);
 
-/** Constant-time string equality via fixed-length SHA-256 digests (safe even for unequal-length inputs). */
-function constantTimeEqual(a: string, b: string): boolean {
-  const digestA = createHash('sha256').update(a, 'utf8').digest();
-  const digestB = createHash('sha256').update(b, 'utf8').digest();
-  return timingSafeEqual(digestA, digestB);
-}
+const ADMIN_RATE_LIMIT = 10;
+const ADMIN_RATE_WINDOW_MS = 60_000;
+/** Throttle for `last_used_at` writes: at most one UPDATE per key per this window. */
+const LAST_USED_TOUCH_MS = 60_000;
 
 export interface AppOptions {
   apiKey?: string;
   corsOrigin?: string;
+  /**
+   * 'none' (default): today's open mode, or v0.2 write-key mode when `apiKey` is set —
+   * byte-identical to pre-v0.3 behavior. 'key': project-scoped keys required on every
+   * /v1/* route (spec3.md §A).
+   */
+  authMode?: AuthMode;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -225,19 +239,19 @@ function validateEvent(raw: unknown): string | null {
   return validateSegmentPayload(data);
 }
 
-function applyEvent(db: Db, event: IngestEvent): void {
+function applyEvent(db: Db, event: IngestEvent, projectId: string): void {
   if (event.type === 'session.started') {
-    store.upsertSession(db, event.data);
+    store.upsertSession(db, event.data, projectId);
   } else if (event.type === 'segment.recorded') {
-    store.upsertSegment(db, event.data);
+    store.upsertSegment(db, event.data, projectId);
   } else if (event.type === 'segment.outcome') {
-    const updated = store.applySegmentOutcome(db, event.data.sessionId, event.data.segmentId, event.data.outcome);
+    const updated = store.applySegmentOutcome(db, event.data.sessionId, event.data.segmentId, event.data.outcome, projectId);
     if (!updated) throw new Error('unknown segment');
   } else {
     // Unlike segment.recorded, session.ended never fabricates a stub session: an unknown
-    // sessionId here (already deleted, or ended before it ever started) is rejected rather
-    // than silently resurrecting/creating a session.
-    const updated = store.endSession(db, event.data.sessionId, event.data.endedAt);
+    // sessionId here (already deleted, ended before it ever started, or owned by a
+    // different project) is rejected rather than silently resurrecting/creating a session.
+    const updated = store.endSession(db, event.data.sessionId, event.data.endedAt, projectId);
     if (!updated) throw new Error('unknown session');
   }
 }
@@ -253,18 +267,18 @@ function liveSessionIdFor(event: IngestEvent): string {
  * is wasted work on every single ingest event for the overwhelmingly common case of no
  * open /live connection.
  */
-function emitLiveEvents(db: Db, bus: SessionBus, event: IngestEvent): void {
+function emitLiveEvents(db: Db, bus: SessionBus, event: IngestEvent, projectId: string): void {
   const sessionId = liveSessionIdFor(event);
   if (bus.listenerCount(sessionId) === 0) return;
 
   if (event.type === 'session.started' || event.type === 'session.ended') {
-    const summary = store.getSessionSummary(db, sessionId);
+    const summary = store.getSessionSummary(db, sessionId, projectId);
     if (summary) bus.emit(sessionId, { event: 'session', data: summary });
   } else if (event.type === 'segment.recorded') {
-    const detail = store.getSegmentDetail(db, sessionId, event.data.index);
+    const detail = store.getSegmentDetail(db, sessionId, event.data.index, projectId);
     if (detail) bus.emit(sessionId, { event: 'segment', data: detail.segment });
   } else if (event.type === 'segment.outcome') {
-    const index = store.getSegmentIndexById(db, sessionId, event.data.segmentId);
+    const index = store.getSegmentIndexById(db, sessionId, event.data.segmentId, projectId);
     if (index !== undefined) {
       bus.emit(sessionId, { event: 'outcome', data: { segmentId: event.data.segmentId, index, outcome: event.data.outcome } });
     }
@@ -311,6 +325,23 @@ function parseStrictNonNegativeInt(raw: string): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/**
+ * Auth context stashed on every /v1/* request by the resolver middleware in createApp.
+ * `createApp` deliberately keeps returning a bare `Hono` (not `Hono<{ Variables }>`) so
+ * its public type doesn't change — a plain `new Hono()` infers `Variables` as `never`,
+ * so route handlers cast through this helper instead of typing the whole app.
+ */
+interface CtxVars {
+  ctProjectId: string;
+  ctRole: KeyRole;
+  ctKeyId?: string;
+}
+type AppContext = Context<{ Variables: CtxVars }>;
+
+function ctxOf(c: Context): AppContext {
+  return c as unknown as AppContext;
+}
+
 // Test-only registry mapping an app instance to its live-tail bus, so tests can assert
 // listener counts without changing createApp's public (Hono-returning) signature.
 const busRegistry = new WeakMap<Hono, SessionBus>();
@@ -326,17 +357,93 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   const bus = new SessionBus();
   busRegistry.set(app, bus);
   const ftsAvailable = hasFtsSupport(db);
+  const authMode: AuthMode = opts.authMode ?? 'none';
+
+  // In-memory only (spec3.md §B/§C): throttles last_used_at writes to ~once/minute/key,
+  // and caps admin-route traffic to 10 req/min/key. Both are per-app-instance state,
+  // same lifetime as `bus` above — fine since there is no multi-process fan-out here.
+  const lastTouch = new Map<string, number>();
+  const adminHits = new Map<string, { count: number; resetAt: number }>();
 
   app.get('/healthz', (c) => c.json({ ok: true }));
 
-  // Writes only require x-api-key; reads stay open even when a key is configured
-  // so the dashboard keeps working (read privacy is a network-level concern).
+  // Resolves { projectId, role } for every /v1/* request and stashes it on the context.
+  // In 'none' mode (open, or legacy write-key mode) everything resolves to the default
+  // project with full access — `requireApiKey` below is what actually gates writes there,
+  // unchanged from v0.2. In 'key' mode, a missing/unknown/revoked key is a 401 here,
+  // before any route handler runs, satisfying "every /v1/* route except /healthz requires
+  // a valid key". EventSource can't set headers, so the live route alone also accepts
+  // `?key=` — this stays the *only* exception (spec3.md §E): /export in particular is
+  // header-only, since the web app downloads it via fetch+blob, which can set headers.
+  // This app never logs request URLs/query strings, so `?key=` on /live is the one place
+  // a key ever appears outside a header.
+  app.use('/v1/*', async (c, next) => {
+    if (authMode !== 'key') {
+      ctxOf(c).set('ctProjectId', store.DEFAULT_PROJECT_ID);
+      ctxOf(c).set('ctRole', 'admin');
+      ctxOf(c).set('ctKeyId', undefined);
+      return next();
+    }
+    const isLiveRoute = c.req.path.endsWith('/live');
+    const provided = c.req.header('x-api-key') ?? (isLiveRoute ? c.req.query('key') : undefined);
+    if (!provided) return c.json({ error: 'unauthorized' }, 401);
+    const resolved = resolveApiKey(db, provided);
+    if (!resolved) return c.json({ error: 'unauthorized' }, 401);
+
+    const now = Date.now();
+    const last = lastTouch.get(resolved.keyId) ?? 0;
+    if (now - last >= LAST_USED_TOUCH_MS) {
+      lastTouch.set(resolved.keyId, now);
+      store.touchKeyLastUsed(db, resolved.keyId);
+    }
+
+    ctxOf(c).set('ctProjectId', resolved.projectId);
+    ctxOf(c).set('ctRole', resolved.role);
+    ctxOf(c).set('ctKeyId', resolved.keyId);
+    await next();
+  });
+
+  // Legacy: writes only require x-api-key (v0.2 write-key mode); reads stay open even
+  // when a key is configured so the dashboard keeps working. Only meaningful in 'none'
+  // mode — in 'key' mode CT_API_KEY is ignored (a one-time warning is printed at boot).
   const requireApiKey: MiddlewareHandler = async (c, next) => {
-    if (opts.apiKey) {
+    if (authMode === 'none' && opts.apiKey) {
       const provided = c.req.header('x-api-key');
       if (!provided || !constantTimeEqual(provided, opts.apiKey)) {
         return c.json({ error: 'unauthorized' }, 401);
       }
+    }
+    await next();
+  };
+
+  // 'key' mode only: read-role keys may GET but not write.
+  const requireWriteRole: MiddlewareHandler = async (c, next) => {
+    if (authMode === 'key') {
+      const role = ctxOf(c).get('ctRole');
+      if (role !== 'write' && role !== 'admin') return c.json({ error: 'unauthorized' }, 401);
+    }
+    await next();
+  };
+
+  // Admin routes are 404 outside 'key' mode — an open local instance exposes no key
+  // management at all — and require an admin-role key inside it.
+  const requireAdminRole: MiddlewareHandler = async (c, next) => {
+    if (authMode !== 'key') return c.json({ error: 'not found' }, 404);
+    const role = ctxOf(c).get('ctRole');
+    if (role !== 'admin') return c.json({ error: 'unauthorized' }, 401);
+    await next();
+  };
+
+  const adminRateLimit: MiddlewareHandler = async (c, next) => {
+    const keyId = ctxOf(c).get('ctKeyId')!;
+    const now = Date.now();
+    const entry = adminHits.get(keyId);
+    if (!entry || now >= entry.resetAt) {
+      adminHits.set(keyId, { count: 1, resetAt: now + ADMIN_RATE_WINDOW_MS });
+    } else if (entry.count >= ADMIN_RATE_LIMIT) {
+      return c.json({ error: 'rate limit exceeded' }, 429);
+    } else {
+      entry.count++;
     }
     await next();
   };
@@ -348,6 +455,7 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   app.post(
     '/v1/ingest',
     requireApiKey,
+    requireWriteRole,
     bodyLimit({
       maxSize: MAX_BODY_BYTES,
       onError: (c) => c.json({ error: 'payload too large' }, 413),
@@ -380,9 +488,10 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
         }
         try {
           const event = events[i] as IngestEvent;
-          applyEvent(db, event);
+          const projectId = ctxOf(c).get('ctProjectId');
+          applyEvent(db, event, projectId);
           accepted++;
-          emitLiveEvents(db, bus, event);
+          emitLiveEvents(db, bus, event, projectId);
         } catch (err) {
           rejected.push({ index: i, reason: err instanceof Error ? err.message : 'unknown error' });
         }
@@ -393,13 +502,18 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     }
   );
 
-  app.get('/v1/stats', (c) => c.json(store.getStats(db)));
+  app.get('/v1/stats', (c) => c.json(store.getStats(db, ctxOf(c).get('ctProjectId'))));
 
   app.get('/v1/sessions', (c) => {
     const limit = clampInt(c.req.query('limit'), 20, 1, 200);
     const offset = clampInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
     const q = c.req.query('q');
-    const result = store.listSessions(db, { limit, offset, q: q && q.length > 0 ? q : undefined });
+    const result = store.listSessions(db, {
+      limit,
+      offset,
+      q: q && q.length > 0 ? q : undefined,
+      projectId: ctxOf(c).get('ctProjectId'),
+    });
     return c.json(result);
   });
 
@@ -408,31 +522,31 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     const q = c.req.query('q');
     if (!q || q.trim().length === 0) return c.json({ error: 'q is required' }, 400);
     const limit = clampInt(c.req.query('limit'), 20, 1, 50);
-    const hits = store.searchSections(db, { q, limit });
+    const hits = store.searchSections(db, { q, limit, projectId: ctxOf(c).get('ctProjectId') });
     return c.json({ hits });
   });
 
   app.get('/v1/sessions/:id', (c) => {
-    const detail = store.getSessionDetail(db, c.req.param('id'));
+    const detail = store.getSessionDetail(db, c.req.param('id'), ctxOf(c).get('ctProjectId'));
     if (!detail) return c.json({ error: 'not found' }, 404);
     return c.json(detail);
   });
 
   app.get('/v1/sessions/:id/trace', (c) => {
-    const trace = store.getSessionTrace(db, c.req.param('id'));
+    const trace = store.getSessionTrace(db, c.req.param('id'), ctxOf(c).get('ctProjectId'));
     if (!trace) return c.json({ error: 'not found' }, 404);
     return c.json(trace);
   });
 
   app.get('/v1/sessions/:id/trace/analytics', (c) => {
-    const trace = store.getSessionTrace(db, c.req.param('id'));
+    const trace = store.getSessionTrace(db, c.req.param('id'), ctxOf(c).get('ctProjectId'));
     if (!trace) return c.json({ error: 'not found' }, 404);
     return c.json(computeAnalytics(trace));
   });
 
   app.get('/v1/sessions/:id/export', (c) => {
     const id = c.req.param('id');
-    const exported = store.exportSession(db, id);
+    const exported = store.exportSession(db, id, ctxOf(c).get('ctProjectId'));
     if (!exported) return c.json({ error: 'not found' }, 404);
     c.header('content-disposition', exportContentDisposition(id));
     return c.json(exported);
@@ -441,7 +555,7 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   app.get('/v1/sessions/:id/segments/:index', (c) => {
     const idx = parseStrictNonNegativeInt(c.req.param('index'));
     if (idx === null) return c.json({ error: 'not found' }, 404);
-    const detail = store.getSegmentDetail(db, c.req.param('id'), idx);
+    const detail = store.getSegmentDetail(db, c.req.param('id'), idx, ctxOf(c).get('ctProjectId'));
     if (!detail) return c.json({ error: 'not found' }, 404);
     return c.json(detail);
   });
@@ -451,7 +565,7 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     // A session that doesn't exist yet (e.g. session.started hasn't arrived) is a
     // legitimate 404 rather than a stream that silently sits open forever — clients
     // should open /live only after the session is known to exist.
-    if (!store.sessionExists(db, sessionId)) return c.json({ error: 'not found' }, 404);
+    if (!store.sessionExists(db, sessionId, ctxOf(c).get('ctProjectId'))) return c.json({ error: 'not found' }, 404);
     return streamSSE(c, async (stream) => {
       let closed = false;
       const unsubscribe = bus.subscribe(sessionId, (msg) => {
@@ -471,8 +585,8 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     });
   });
 
-  app.delete('/v1/sessions/:id', requireApiKey, (c) => {
-    const deleted = store.deleteSession(db, c.req.param('id'));
+  app.delete('/v1/sessions/:id', requireApiKey, requireWriteRole, (c) => {
+    const deleted = store.deleteSession(db, c.req.param('id'), ctxOf(c).get('ctProjectId'));
     if (!deleted) return c.json({ error: 'not found' }, 404);
     return c.json({ ok: true });
   });
@@ -480,6 +594,7 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
   app.post(
     '/v1/import',
     requireApiKey,
+    requireWriteRole,
     bodyLimit({
       maxSize: MAX_BODY_BYTES,
       onError: (c) => c.json({ error: 'payload too large' }, 413),
@@ -529,23 +644,24 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
       // still rolls back everything from this outer transaction, including segments
       // already committed earlier in the loop.
       let failingLabel: string | undefined;
+      const projectId = ctxOf(c).get('ctProjectId');
       try {
         const importTx = db.transaction(() => {
           failingLabel = 'session';
-          store.upsertSession(db, session as unknown as Session);
+          store.upsertSession(db, session as unknown as Session, projectId);
           const segments = segmentsRaw as Array<Record<string, unknown>>;
           for (let i = 0; i < segments.length; i++) {
             const seg = segments[i]!;
             failingLabel = `segments[${i}]`;
-            store.upsertSegment(db, seg as unknown as SegmentWithSections);
+            store.upsertSegment(db, seg as unknown as SegmentWithSections, projectId);
             if (seg.outcome !== undefined) {
-              store.applySegmentOutcome(db, seg.sessionId as string, seg.id as string, seg.outcome as SegmentOutcome);
+              store.applySegmentOutcome(db, seg.sessionId as string, seg.id as string, seg.outcome as SegmentOutcome, projectId);
             }
           }
           failingLabel = undefined;
           const s = session as Record<string, unknown>;
           if (typeof s.endedAt === 'string' && s.endedAt.length > 0) {
-            store.endSession(db, s.id as string, s.endedAt);
+            store.endSession(db, s.id as string, s.endedAt, projectId);
           }
         });
         importTx();
@@ -557,6 +673,66 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
       return c.json({ accepted: { segments: segmentsRaw.length } }, 200);
     }
   );
+
+  // Admin surface (spec3.md §C): self-host key management. `requireAdminRole` 404s the
+  // entire subtree outside 'key' mode, so an open local instance exposes no key
+  // management at all; `adminRateLimit` caps it to 10 req/min per admin key.
+  app.use('/v1/admin/*', requireAdminRole, adminRateLimit);
+
+  app.post('/v1/admin/projects', async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'malformed JSON body' }, 400);
+    }
+    if (!isRecord(body) || typeof body.name !== 'string' || body.name.length === 0) {
+      return c.json({ error: 'name is required' }, 400);
+    }
+    if (body.name.length > MAX_STRING_LEN) return c.json({ error: 'name exceeds max length' }, 400);
+    const project = store.createProject(db, body.name);
+    return c.json(project, 201);
+  });
+
+  app.get('/v1/admin/projects', (c) => c.json({ projects: store.listProjects(db) }));
+
+  app.post('/v1/admin/projects/:id/keys', async (c) => {
+    const projectId = c.req.param('id');
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'malformed JSON body' }, 400);
+    }
+    if (!isRecord(body) || typeof body.name !== 'string' || body.name.length === 0) {
+      return c.json({ error: 'name is required' }, 400);
+    }
+    if (body.name.length > MAX_STRING_LEN) return c.json({ error: 'name exceeds max length' }, 400);
+    if (typeof body.role !== 'string' || !KEY_ROLES.has(body.role)) {
+      return c.json({ error: 'role must be one of read, write, admin' }, 400);
+    }
+    const created = store.createProjectKey(db, projectId, body.name, body.role as KeyRole);
+    if (!created) return c.json({ error: 'not found' }, 404);
+    return c.json(created, 201);
+  });
+
+  app.get('/v1/admin/projects/:id/keys', (c) => {
+    const projectId = c.req.param('id');
+    if (!store.getProject(db, projectId)) return c.json({ error: 'not found' }, 404);
+    return c.json({ keys: store.listProjectKeys(db, projectId) });
+  });
+
+  app.post('/v1/admin/keys/:id/revoke', (c) => {
+    const revoked = store.revokeProjectKey(db, c.req.param('id'));
+    if (!revoked) return c.json({ error: 'not found' }, 404);
+    return c.json({ ok: true });
+  });
+
+  app.delete('/v1/admin/projects/:id', (c) => {
+    const deleted = store.deleteProject(db, c.req.param('id'));
+    if (!deleted) return c.json({ error: 'not found' }, 404);
+    return c.json({ ok: true });
+  });
 
   return app;
 }

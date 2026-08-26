@@ -1,0 +1,47 @@
+name: Server image
+
+# Only fires on version tags. A plain push to main never publishes an image.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build and push server image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build from the repo root context — the server Dockerfile needs the
+      # root lockfile and the workspace package.jsons (see server/Dockerfile).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/context-trace-server:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/context-trace-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

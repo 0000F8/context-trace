@@ -30,6 +30,7 @@ export function createClient(options: ClientOptions): Client {
 
 export { estimateTokens, fnv1a64, generateId } from '@context-trace/types';
 export type {
+  ContentMode,
   IngestEvent,
   IngestRequest,
   IngestResponse,

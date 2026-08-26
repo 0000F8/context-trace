@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { AnnotatedSection, SegmentDetail, TraceSpan } from '@context-trace/types';
 import { getSegmentDetail } from '../lib/api';
+import { canDiff, hasContent, HASH_ONLY_PLACEHOLDER } from '../lib/content';
 import { diffLines } from '../lib/diff';
 import { formatTokens } from '../lib/format';
 import { LoadingState } from './LoadingState';
@@ -116,16 +117,22 @@ export function SectionDrawer({ sessionId, sectionKey, span, service, color, ini
                 <span>{formatTokens(section.tokens)} tokens</span>
               </div>
               {section.state === 'changed' ? (
-                <div className="section-drawer__diff">
-                  {diffLines(section.prevContent ?? '', section.content ?? '').map((line, i) => (
-                    <div key={i} className={`diff-line diff-line--${line.type}`}>
-                      <span className="diff-line__marker">{line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' '}</span>
-                      <span className="diff-line__text">{line.text}</span>
-                    </div>
-                  ))}
-                </div>
+                canDiff(section.prevContent, section.content) ? (
+                  <div className="section-drawer__diff">
+                    {diffLines(section.prevContent ?? '', section.content ?? '').map((line, i) => (
+                      <div key={i} className={`diff-line diff-line--${line.type}`}>
+                        <span className="diff-line__marker">{line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' '}</span>
+                        <span className="diff-line__text">{line.text}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="section-drawer__content hash-only-placeholder">{HASH_ONLY_PLACEHOLDER}</p>
+                )
+              ) : hasContent(section.content) ? (
+                <pre className="section-drawer__content">{section.content}</pre>
               ) : (
-                <pre className="section-drawer__content">{section.content ?? ''}</pre>
+                <p className="section-drawer__content hash-only-placeholder">{HASH_ONLY_PLACEHOLDER}</p>
               )}
             </>
           )}

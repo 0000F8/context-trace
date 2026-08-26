@@ -124,7 +124,10 @@ export function SessionsPage() {
           {debouncedQuery !== '' && searchState.status === 'loading' && <LoadingState label="Searching" />}
           {debouncedQuery !== '' && searchState.status === 'error' && <ErrorState message={searchState.error} onRetry={searchState.reload} />}
           {debouncedQuery !== '' && searchState.status === 'ready' && searchState.data && searchState.data.hits.length === 0 && (
-            <EmptyState title={`No content matches "${debouncedQuery}".`} body="Try a different search term." />
+            <EmptyState
+              title={`No content matches "${debouncedQuery}".`}
+              body="Try a different search term. Hash-only sessions aren't searchable — nothing is indexed for them."
+            />
           )}
           {debouncedQuery !== '' && searchState.status === 'ready' && searchState.data && searchState.data.hits.length > 0 && (
             <SearchResults hits={searchState.data.hits} />

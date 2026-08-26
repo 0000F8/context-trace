@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AnnotatedSection, SegmentDetail, Section, TraceSegment } from '@context-trace/types';
 import { diffLines } from '../lib/diff';
+import { canDiff, hasContent, HASH_ONLY_PLACEHOLDER } from '../lib/content';
 import { formatLatency, formatTokens, previewLine } from '../lib/format';
 import { buildPromptMarkdown, buildPromptMessages } from '../lib/prompt';
 import { ServiceChip } from './ServiceChip';
@@ -162,7 +163,11 @@ function SectionsTab({
             <span className={`inspector__badge inspector__badge--${s.state}`}>{s.state}</span>
             <span className="inspector__row-tokens">{formatTokens(s.tokens)}</span>
           </button>
-          {s.content && <p className="inspector__preview">{previewLine(s.content)}</p>}
+          {hasContent(s.content) ? (
+            <p className="inspector__preview">{previewLine(s.content)}</p>
+          ) : (
+            <p className="inspector__preview hash-only-placeholder">{HASH_ONLY_PLACEHOLDER}</p>
+          )}
         </li>
       ))}
       {detail.removed.map((s) => (
@@ -200,7 +205,11 @@ function ChangesTab({
       {added.map((s) => (
         <section key={s.key} className="change-block change-block--added">
           <ChangeHeader section={s} colorMap={colorMap} tag="added" onOpen={() => onOpenSection(s.key)} />
-          {s.content && <pre className="change-block__content">{s.content}</pre>}
+          {hasContent(s.content) ? (
+            <pre className="change-block__content">{s.content}</pre>
+          ) : (
+            <p className="change-block__content hash-only-placeholder">{HASH_ONLY_PLACEHOLDER}</p>
+          )}
         </section>
       ))}
       {changed.map((s) => (
@@ -212,13 +221,21 @@ function ChangesTab({
             delta={s.prevTokens != null ? s.tokens - s.prevTokens : null}
             onOpen={() => onOpenSection(s.key)}
           />
-          <LineDiff prev={s.prevContent ?? ''} next={s.content ?? ''} />
+          {canDiff(s.prevContent, s.content) ? (
+            <LineDiff prev={s.prevContent ?? ''} next={s.content ?? ''} />
+          ) : (
+            <p className="change-block__content hash-only-placeholder">{HASH_ONLY_PLACEHOLDER}</p>
+          )}
         </section>
       ))}
       {removed.map((s) => (
         <section key={s.key} className="change-block change-block--removed">
           <ChangeHeader section={s} colorMap={colorMap} tag="removed" onOpen={() => onOpenSection(s.key)} />
-          {s.content && <pre className="change-block__content change-block__content--struck">{s.content}</pre>}
+          {hasContent(s.content) ? (
+            <pre className="change-block__content change-block__content--struck">{s.content}</pre>
+          ) : (
+            <p className="change-block__content hash-only-placeholder">{HASH_ONLY_PLACEHOLDER}</p>
+          )}
         </section>
       ))}
     </div>

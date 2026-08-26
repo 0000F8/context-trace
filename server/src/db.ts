@@ -46,6 +46,36 @@ CREATE TABLE IF NOT EXISTS sections (
 CREATE INDEX IF NOT EXISTS idx_sections_segment ON sections(segment_id);
 `;
 
+/**
+ * v0.3 tenancy tables (spec3.md §B). `projects` and `project_keys` are new tables so
+ * `CREATE TABLE IF NOT EXISTS` is enough on its own; `sessions.project_id` is an added
+ * column on an existing table, so it needs the same guarded-migration treatment as
+ * `segments.outcome` below (see `ensureProjectIdColumn`).
+ */
+const PROJECT_SCHEMA = `
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_keys (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('read','write','admin')),
+  key_hash TEXT NOT NULL UNIQUE,
+  prefix TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_keys_project ON project_keys(project_id);
+`;
+
+export const DEFAULT_PROJECT_ID = 'default';
+
 const FTS_SCHEMA = `
 CREATE VIRTUAL TABLE IF NOT EXISTS sections_fts USING fts5(
   content, key, service, session_id UNINDEXED, segment_id UNINDEXED, segment_index UNINDEXED
@@ -62,6 +92,32 @@ function ensureOutcomeColumn(db: Db): void {
   const cols = db.prepare('PRAGMA table_info(segments)').all() as Array<{ name: string }>;
   if (!cols.some((col) => col.name === 'outcome')) {
     db.exec('ALTER TABLE segments ADD COLUMN outcome TEXT');
+  }
+}
+
+/**
+ * Guarded migration for `sessions.project_id` (v0.3): existing DB files predate the
+ * column, so `ADD COLUMN ... DEFAULT 'default'` both adds it and backfills every
+ * existing row to the default project in one step. Same pragma-probe pattern as
+ * `ensureOutcomeColumn` — safe to call on every boot, including already-migrated files.
+ */
+function ensureProjectIdColumn(db: Db): void {
+  const cols = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+  if (!cols.some((col) => col.name === 'project_id')) {
+    db.exec(`ALTER TABLE sessions ADD COLUMN project_id TEXT NOT NULL DEFAULT '${DEFAULT_PROJECT_ID}'`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)');
+}
+
+/** Boot creates the `default` project if absent, so 'none' mode always has somewhere to resolve to. */
+function ensureDefaultProject(db: Db): void {
+  const exists = db.prepare('SELECT 1 FROM projects WHERE id = ?').get(DEFAULT_PROJECT_ID);
+  if (!exists) {
+    db.prepare('INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)').run(
+      DEFAULT_PROJECT_ID,
+      'Default',
+      new Date().toISOString()
+    );
   }
 }
 
@@ -134,6 +190,9 @@ export function openDb(path: string): Db {
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
   ensureOutcomeColumn(db);
+  db.exec(PROJECT_SCHEMA);
+  ensureProjectIdColumn(db);
+  ensureDefaultProject(db);
 
   const ftsOk = tryCreateFts(db);
   setFtsSupport(db, ftsOk);

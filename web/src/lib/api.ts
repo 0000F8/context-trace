@@ -10,6 +10,8 @@ import type {
 
 const BASE = '/api/v1';
 
+const API_KEY_STORAGE = 'ct:apiKey';
+
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
@@ -17,6 +19,49 @@ export class ApiError extends Error {
     this.name = 'ApiError';
     this.status = status;
   }
+}
+
+/** Reads the stored API key, if any. `localStorage` access is wrapped since some environments (private tabs, SSR) can throw. */
+export function getApiKey(): string | null {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE);
+  } catch {
+    return null;
+  }
+}
+
+export function hasApiKey(): boolean {
+  return getApiKey() != null;
+}
+
+export function setApiKey(key: string): void {
+  try {
+    localStorage.setItem(API_KEY_STORAGE, key);
+  } catch {
+    // storage unavailable — the key just won't survive a reload.
+  }
+}
+
+export function clearApiKey(): void {
+  try {
+    localStorage.removeItem(API_KEY_STORAGE);
+  } catch {
+    // storage unavailable — nothing to clear.
+  }
+}
+
+type UnauthorizedListener = () => void;
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+/** Subscribes to 401 responses from any request. Returns an unsubscribe function. */
+export function onUnauthorized(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => unauthorizedListeners.delete(listener);
+}
+
+function authHeaders(): HeadersInit {
+  const key = getApiKey();
+  return key ? { 'x-api-key': key } : {};
 }
 
 async function parseErrorBody(res: Response, fallback: string): Promise<string> {
@@ -31,13 +76,23 @@ async function parseErrorBody(res: Response, fallback: string): Promise<string> 
   return fallback;
 }
 
-async function request<T>(path: string): Promise<T> {
+async function doFetch(path: string, init?: RequestInit): Promise<Response> {
   let res: Response;
   try {
-    res = await fetch(`${BASE}${path}`);
+    res = await fetch(`${BASE}${path}`, { ...init, headers: { ...authHeaders(), ...init?.headers } });
   } catch {
     throw new ApiError('Could not reach the trace server. Is it running?', 0);
   }
+  if (res.status === 401) {
+    // Fires before the caller's own catch runs, so the app can swap in the
+    // key prompt instead of (or ahead of) any component's generic error state.
+    unauthorizedListeners.forEach((listener) => listener());
+  }
+  return res;
+}
+
+async function request<T>(path: string): Promise<T> {
+  const res = await doFetch(path);
   if (!res.ok) {
     throw new ApiError(await parseErrorBody(res, `Request failed (${res.status})`), res.status);
   }
@@ -80,23 +135,63 @@ export function searchContent(q: string, limit = 20): Promise<SearchResponse> {
   return request<SearchResponse>(`/search?q=${encodeURIComponent(q)}&limit=${limit}`);
 }
 
-/** Path (through the proxy) for a session-export download link. */
+/** Path (through the proxy) for a session export. Exported for anyone scripting against the API directly; the web UI itself downloads via `fetchExport` below so the key can ride in a header instead of this URL. */
 export function exportUrl(id: string): string {
   return `${BASE}/sessions/${encodeURIComponent(id)}/export`;
 }
 
-/** SSE URL for the live tail of a session (consume with EventSource). */
+export interface ExportResult {
+  blob: Blob;
+  filename: string;
+}
+
+/** Extracts a filename from a `content-disposition` header, handling both the plain and RFC 5987 (`filename*=UTF-8''...`) forms. */
+function filenameFromDisposition(disposition: string | null): string | null {
+  if (!disposition) return null;
+  const utf8Match = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      // malformed encoding — fall through to the plain form below.
+    }
+  }
+  const plainMatch = /filename="?([^";]+)"?/i.exec(disposition);
+  return plainMatch?.[1]?.trim() || null;
+}
+
+/**
+ * Fetches a session export through the same authenticated path as every
+ * other request (so `x-api-key` rides in a header, not the URL, and a 401
+ * here participates in the normal key-prompt flow) and hands back a Blob the
+ * caller can turn into a download.
+ */
+export async function fetchExport(id: string): Promise<ExportResult> {
+  const res = await doFetch(`/sessions/${encodeURIComponent(id)}/export`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorBody(res, `Export failed (${res.status})`), res.status);
+  }
+  const blob = await res.blob();
+  const filename = filenameFromDisposition(res.headers.get('content-disposition')) ?? `${id}.context-trace.json`;
+  return { blob, filename };
+}
+
+/**
+ * SSE URL for the live tail of a session (consume with EventSource).
+ *
+ * `EventSource` can't set request headers, so it can't carry `x-api-key` the
+ * way every other request does. This is the one deliberate exception to "the
+ * key never appears in a URL": in key mode, the live endpoint also accepts
+ * `?key=`, checked server-side against the same hashes as the header.
+ */
 export function liveUrl(id: string): string {
-  return `${BASE}/sessions/${encodeURIComponent(id)}/live`;
+  const key = getApiKey();
+  const path = `/sessions/${encodeURIComponent(id)}/live`;
+  return key ? `${BASE}${path}?key=${encodeURIComponent(key)}` : `${BASE}${path}`;
 }
 
 export async function deleteSession(id: string): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
-  } catch {
-    throw new ApiError('Could not reach the trace server. Is it running?', 0);
-  }
+  const res = await doFetch(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
   if (!res.ok) {
     throw new ApiError(await parseErrorBody(res, `Delete failed (${res.status})`), res.status);
   }

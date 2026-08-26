@@ -3,16 +3,47 @@
   "version": "0.1.0",
   "description": "Capture LLM context assemblies (sessions, segments, sections) and ship them to a context-trace server.",
   "type": "module",
+  "license": "Apache-2.0",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
-  "files": ["dist"],
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0000F8/context-trace.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://github.com/0000F8/context-trace/tree/main/packages/sdk#readme",
+  "bugs": "https://github.com/0000F8/context-trace/issues",
+  "keywords": [
+    "llm",
+    "observability",
+    "tracing",
+    "context-engineering",
+    "agent",
+    "sdk",
+    "prompt-engineering"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "@context-trace/types": "0.1.0"

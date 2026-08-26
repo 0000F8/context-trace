@@ -6,6 +6,7 @@
  */
 
 import type {
+  ContentMode,
   IngestEvent,
   IngestRequest,
   IngestResponse,
@@ -53,6 +54,28 @@ export interface ClientOptions {
   onError?: (err: Error) => void;
   /** When false, every capture call is a no-op and nothing is queued or sent. Default true. */
   enabled?: boolean;
+  /**
+   * How much of a section's payload leaves this process. Default `'full'`.
+   * In `'hash-only'`, `content` is omitted from the wire payload for every
+   * section on every segment built from this client, while `contentHash`
+   * (computed locally from the real content) and `tokens` are still shipped
+   * — composition, diffs, spans, and analytics keep working without
+   * exposing text. Section `key` and `service` are identifiers, not
+   * content, and always ship regardless of mode; keep secrets out of them.
+   * Overridable per segment via `session.segment({ contentMode })`.
+   */
+  contentMode?: ContentMode;
+  /**
+   * Runs on every section, for every segment built from this client, before
+   * hashing and before content-mode stripping — so returning a rewritten
+   * `content` here changes `contentHash` too. Return `null` to drop the
+   * section entirely (it never reaches the queue, and later sections keep
+   * contiguous `position`s starting from 0). **Fails closed**: if this
+   * throws, the error is reported via `onError` and the section is dropped
+   * — it is never shipped with its original, unredacted content. Overridable
+   * per segment via `session.segment({ redact })`.
+   */
+  redact?: (section: SectionInput) => SectionInput | null;
 }
 
 export interface StartSessionOptions {
@@ -75,6 +98,10 @@ export interface SegmentOptions {
   /** ISO 8601 timestamp; defaults to now. */
   timestamp?: string;
   metadata?: Record<string, unknown>;
+  /** Overrides the client's `contentMode` for this segment only. */
+  contentMode?: ContentMode;
+  /** Overrides the client's `redact` for this segment only. */
+  redact?: (section: SectionInput) => SectionInput | null;
 }
 
 export interface SectionInput {
@@ -160,6 +187,24 @@ function backoffDelay(attempt: number): number {
   return BACKOFF_BASE_MS * 2 ** (attempt - 1);
 }
 
+/**
+ * `responseText` on an outcome is model output — exactly as sensitive as
+ * section content, and withheld the same way in `'hash-only'` mode.
+ * `latencyMs`, `model`, and `scores` are metadata, not content, and always
+ * ship. `error` is deliberately NOT stripped here: provider error strings
+ * can't be hashed usefully the way content can, and scrubbing them is the
+ * caller's responsibility (see README) since this SDK has no way to know
+ * what a given provider's error messages contain.
+ */
+function stripResponseTextIfHashOnly(
+  outcome: SegmentOutcome,
+  contentMode: ContentMode,
+): SegmentOutcome {
+  if (contentMode !== 'hash-only' || outcome.responseText === undefined) return outcome;
+  const { responseText: _responseText, ...rest } = outcome;
+  return rest;
+}
+
 /** Thrown by send() for a non-2xx HTTP response; carries the status for retry classification. */
 class IngestHttpError extends Error {
   constructor(public readonly status: number) {
@@ -199,6 +244,10 @@ export class ClientImpl implements Client {
   private readonly maxSessions: number;
   private readonly onErrorCb: ((err: Error) => void) | undefined;
   private readonly enabled: boolean;
+  /** Client-level default, overridable per segment (see `SessionHandleImpl.segment`). */
+  readonly defaultContentMode: ContentMode;
+  /** Client-level default, overridable per segment (see `SessionHandleImpl.segment`). */
+  readonly defaultRedact: ((section: SectionInput) => SectionInput | null) | undefined;
 
   private queue: IngestEvent[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -226,6 +275,8 @@ export class ClientImpl implements Client {
     this.maxSessions = sanitizeOption(options.maxSessions, DEFAULT_MAX_SESSIONS, 1);
     this.onErrorCb = options.onError;
     this.enabled = options.enabled ?? true;
+    this.defaultContentMode = options.contentMode === 'hash-only' ? 'hash-only' : 'full';
+    this.defaultRedact = options.redact;
 
     if (this.enabled && this.flushIntervalMs > 0) {
       this.timer = setInterval(() => {
@@ -476,6 +527,16 @@ class SessionHandleImpl implements SessionHandle {
     }
     const id = options.id ?? generateId('seg');
     const timestamp = options.timestamp ?? new Date().toISOString();
+    // Per-segment override wins in both directions: an explicit
+    // contentMode/redact on this call replaces the client default entirely
+    // for this segment, rather than merging with it.
+    const contentMode: ContentMode =
+      options.contentMode === undefined
+        ? this.client.defaultContentMode
+        : options.contentMode === 'hash-only'
+          ? 'hash-only'
+          : 'full';
+    const redact = options.redact === undefined ? this.client.defaultRedact : options.redact;
     return new SegmentBuilderImpl(
       this.client,
       this.id,
@@ -486,13 +547,28 @@ class SessionHandleImpl implements SessionHandle {
       options.label,
       options.model,
       options.metadata,
+      contentMode,
+      redact,
     );
   }
 
+  /**
+   * There is no segment builder in hand for this by-id form, so a
+   * per-segment `contentMode` override set on the original `segment(...)`
+   * call cannot be recovered here — this always applies the *client-level*
+   * `defaultContentMode`, not any per-segment override. If your hooks rely
+   * on a per-segment override and also call `session.outcome(segmentId,
+   * ...)` for that same segment, hold the `SegmentBuilder` and call
+   * `segment.outcome(...)` on it directly instead so the override applies.
+   */
   outcome(segmentId: string, outcome: SegmentOutcome): void {
     this.client.enqueue({
       type: 'segment.outcome',
-      data: { sessionId: this.id, segmentId, outcome },
+      data: {
+        sessionId: this.id,
+        segmentId,
+        outcome: stripResponseTextIfHashOnly(outcome, this.client.defaultContentMode),
+      },
     });
   }
 
@@ -518,6 +594,8 @@ class SegmentBuilderImpl implements SegmentBuilder {
     private readonly label: string | undefined,
     private readonly model: string | undefined,
     private readonly metadata: Record<string, unknown> | undefined,
+    private readonly contentMode: ContentMode,
+    private readonly redact: ((section: SectionInput) => SectionInput | null) | undefined,
   ) {}
 
   section(input: SectionInput): SegmentBuilder {
@@ -528,19 +606,40 @@ class SegmentBuilderImpl implements SegmentBuilder {
         );
         return this;
       }
-      const content = input.content;
+      let effective = input;
+      if (this.redact) {
+        try {
+          const result = this.redact(input);
+          if (result === null) return this; // dropped; position stays contiguous
+          effective = result;
+        } catch (err) {
+          // Fail closed: never ship content a failing redactor was meant to
+          // scrub. Drop the section entirely instead of falling back to the
+          // pre-redaction input.
+          this.client.reportError(
+            new Error(
+              `context-trace: redact() threw for section "${input.key}" on segment ${this.id}; ` +
+                `dropping the section (fail closed): ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
+          return this;
+        }
+      }
+      // contentHash and tokens are always derived from the real (redacted)
+      // content, computed here before any hash-only stripping below.
+      const content = effective.content;
       const contentHash = fnv1a64(content ?? '');
-      const tokens = input.tokens ?? estimateTokens(content ?? '');
+      const tokens = effective.tokens ?? estimateTokens(content ?? '');
       this.sections.push({
-        key: input.key,
-        service: input.service,
-        serviceKind: input.serviceKind,
-        role: input.role,
+        key: effective.key,
+        service: effective.service,
+        serviceKind: effective.serviceKind,
+        role: effective.role,
         position: 0, // reassigned in call order at record() time
-        content,
+        content: this.contentMode === 'hash-only' ? undefined : content,
         contentHash,
         tokens,
-        metadata: input.metadata,
+        metadata: effective.metadata,
       });
     } catch (err) {
       this.client.reportError(err);
@@ -588,7 +687,11 @@ class SegmentBuilderImpl implements SegmentBuilder {
       }
       this.client.enqueue({
         type: 'segment.outcome',
-        data: { sessionId: this.sessionId, segmentId: this.id, outcome },
+        data: {
+          sessionId: this.sessionId,
+          segmentId: this.id,
+          outcome: stripResponseTextIfHashOnly(outcome, this.contentMode),
+        },
       });
     } catch (err) {
       this.client.reportError(err);

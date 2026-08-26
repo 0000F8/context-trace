@@ -1,4 +1,5 @@
 import type { IngestEvent, IngestRequest } from '@context-trace/types';
+import { estimateTokens, fnv1a64 } from '@context-trace/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createClient } from './index.js';
 
@@ -485,6 +486,361 @@ describe('option validation', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
     expect(events).toHaveLength(4);
+  });
+});
+
+describe('content modes', () => {
+  it('full mode ships content unchanged (regression)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'hello world' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    const section = recorded.data.sections[0];
+    expect(section?.content).toBe('hello world');
+    expect(section?.contentHash).toBe(fnv1a64('hello world'));
+    expect(section?.tokens).toBe(estimateTokens('hello world'));
+  });
+
+  it('hash-only mode omits content but preserves contentHash matching full-mode hash, and preserves tokens', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'hello world', tokens: 7 });
+    seg.record();
+
+    await ct.flush();
+
+    const rawBody = String(
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit?])[1]?.body,
+    );
+    expect(rawBody).not.toContain('hello world');
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    const section = recorded.data.sections[0];
+    expect(section?.content).toBeUndefined();
+    expect(section?.contentHash).toBe(fnv1a64('hello world'));
+    expect(section?.tokens).toBe(7);
+  });
+
+  it('per-segment contentMode override wins over the client default (client full, segment hash-only)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call', contentMode: 'hash-only' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'secret' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBeUndefined();
+    expect(recorded.data.sections[0]?.contentHash).toBe(fnv1a64('secret'));
+  });
+
+  it('per-segment contentMode override wins over the client default (client hash-only, segment full)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call', contentMode: 'full' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'visible' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBe('visible');
+  });
+});
+
+describe('redact', () => {
+  it('rewrites content before hashing, so contentHash reflects the redacted content (order: redact -> hash -> strip)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      redact: (s) => ({ ...s, content: s.content?.replace('SECRET', '[REDACTED]') }),
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'my SECRET value' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    const section = recorded.data.sections[0];
+    expect(section?.content).toBe('my [REDACTED] value');
+    expect(section?.contentHash).toBe(fnv1a64('my [REDACTED] value'));
+    expect(section?.contentHash).not.toBe(fnv1a64('my SECRET value'));
+  });
+
+  it('returning null drops the section and keeps remaining positions contiguous from 0', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      redact: (s) => (s.key === 'drop-me' ? null : s),
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'first', service: 'svc', serviceKind: 'other', content: 'a' });
+    seg.section({ key: 'drop-me', service: 'svc', serviceKind: 'other', content: 'b' });
+    seg.section({ key: 'third', service: 'svc', serviceKind: 'other', content: 'c' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections.map((s) => [s.key, s.position])).toEqual([
+      ['first', 0],
+      ['third', 1],
+    ]);
+  });
+
+  it('fails closed: a throwing redact drops the section and reports via onError, with no content on the wire', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      onError,
+      redact: (s) => {
+        if (s.key === 'boom') throw new Error('redactor exploded');
+        return s;
+      },
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'ok', service: 'svc', serviceKind: 'other', content: 'fine' });
+    seg.section({ key: 'boom', service: 'svc', serviceKind: 'other', content: 'top secret payload' });
+    seg.record();
+
+    await ct.flush();
+
+    const rawBody = String(
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit?])[1]?.body,
+    );
+    expect(rawBody).not.toContain('top secret payload');
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections.map((s) => s.key)).toEqual(['ok']);
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+    expect((onError.mock.calls[0]?.[0] as Error).message).toContain('redactor exploded');
+  });
+
+  it('per-segment redact override wins over the client default', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      redact: () => {
+        throw new Error('client-level redact should never run for this segment');
+      },
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({
+      kind: 'llm_call',
+      redact: (s) => ({ ...s, content: 'overridden' }),
+    });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'original' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBe('overridden');
+  });
+
+  it('a segment without a redact override (client default undefined) leaves content untouched', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'plain' });
+    seg.record();
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const recorded = events.find((e) => e.type === 'segment.recorded');
+    if (recorded?.type !== 'segment.recorded') throw new Error('unreachable');
+    expect(recorded.data.sections[0]?.content).toBe('plain');
+  });
+});
+
+describe('hash-only outcome (responseText)', () => {
+  it('hash-only mode omits responseText but keeps latencyMs/model/scores/error', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+    seg.outcome({
+      responseText: 'sensitive model output',
+      latencyMs: 842,
+      model: 'claude-sonnet-5',
+      scores: { helpfulness: 0.9 },
+      error: 'timeout',
+    });
+
+    await ct.flush();
+
+    const rawBody = String(
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit?])[1]?.body,
+    );
+    expect(rawBody).not.toContain('sensitive model output');
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const outcomeEvent = events.find((e) => e.type === 'segment.outcome');
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data.outcome.responseText).toBeUndefined();
+    expect(outcomeEvent.data.outcome.latencyMs).toBe(842);
+    expect(outcomeEvent.data.outcome.model).toBe('claude-sonnet-5');
+    expect(outcomeEvent.data.outcome.scores).toEqual({ helpfulness: 0.9 });
+    expect(outcomeEvent.data.outcome.error).toBe('timeout');
+  });
+
+  it('full mode still sends responseText (regression)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+    seg.outcome({ responseText: 'visible model output' });
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const outcomeEvent = events.find((e) => e.type === 'segment.outcome');
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data.outcome.responseText).toBe('visible model output');
+  });
+
+  it('per-segment hash-only override applies to that segment\'s outcome (client default full)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call', contentMode: 'hash-only' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+    seg.outcome({ responseText: 'should be withheld', latencyMs: 10 });
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const outcomeEvent = events.find((e) => e.type === 'segment.outcome');
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data.outcome.responseText).toBeUndefined();
+    expect(outcomeEvent.data.outcome.latencyMs).toBe(10);
+  });
+
+  it('per-segment full override applies to that segment\'s outcome (client default hash-only)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call', contentMode: 'full' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+    seg.outcome({ responseText: 'should ship' });
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const outcomeEvent = events.find((e) => e.type === 'segment.outcome');
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data.outcome.responseText).toBe('should ship');
+  });
+
+  it('session.outcome(segmentId, o) strips responseText per the client-level contentMode (no segment context available)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({
+      endpoint: 'http://localhost:4720',
+      flushIntervalMs: 0,
+      contentMode: 'hash-only',
+    });
+    ct.session('existing-session-id').outcome('some-segment-id', {
+      responseText: 'stateless correlation output',
+      error: 'boom',
+    });
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const outcomeEvent = events[0];
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data.outcome.responseText).toBeUndefined();
+    expect(outcomeEvent.data.outcome.error).toBe('boom');
   });
 });
 

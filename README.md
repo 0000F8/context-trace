@@ -30,6 +30,21 @@ npm run dev:web        # web on :5173, /api proxied to :4720
 npm run seed           # demo data against the local DB
 ```
 
+## Editions
+
+context-trace is open core, and the line is documented: see
+[docs/EDITIONS.md](docs/EDITIONS.md). Everything you need to trace your own
+agents — SDKs, the trace engine, analytics and findings, live tail, compare,
+search, export, hash-only mode, projects and API keys, self-hosting — is
+Apache-2.0 and stays that way. The hosted service sells operations (managed
+multi-tenant storage, retention, SSO/RBAC, alerting, long-retention fleet
+analytics), not withheld features.
+
+Privacy note: if your constraint is "prompt text can't leave our network," you
+may not need self-hosting — every SDK supports **hash-only mode**, where content
+stays in your process while hashes and token counts ship, and every diff,
+finding, and budget analysis still works. See [docs/PRIVACY.md](docs/PRIVACY.md).
+
 ## Server configuration
 
 | Env var | Default | Meaning |

@@ -65,6 +65,59 @@ describe('openDb', () => {
     }
   });
 
+  it('migrates a pre-v0.3 db file by adding sessions.project_id + projects/project_keys, backfilling existing sessions to default', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ct-migration-v3-'));
+    const path = join(dir, 'old.db');
+    try {
+      // Build the exact pre-v0.3 schema (v0.2 shape: no project_id, no projects/project_keys
+      // tables at all) directly, bypassing openDb, then insert a row that must survive.
+      const raw = new Database(path);
+      raw.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, agent TEXT, metadata TEXT,
+          started_at TEXT NOT NULL, ended_at TEXT
+        );
+        CREATE TABLE segments (
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, idx INTEGER NOT NULL,
+          label TEXT, kind TEXT NOT NULL, model TEXT, timestamp TEXT NOT NULL, metadata TEXT,
+          outcome TEXT,
+          UNIQUE(session_id, idx)
+        );
+        CREATE TABLE sections (
+          segment_id TEXT NOT NULL, key TEXT NOT NULL, service TEXT NOT NULL,
+          service_kind TEXT NOT NULL, role TEXT, position INTEGER NOT NULL,
+          content TEXT, content_hash TEXT NOT NULL, tokens INTEGER NOT NULL, metadata TEXT,
+          PRIMARY KEY (segment_id, key)
+        );
+      `);
+      raw
+        .prepare('INSERT INTO sessions (id, name, started_at) VALUES (?, ?, ?)')
+        .run('s1', 'pre-existing session', '2026-01-01T00:00:00.000Z');
+      raw.close();
+
+      const db = openDb(path);
+
+      const cols = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+      expect(cols.some((c) => c.name === 'project_id')).toBe(true);
+
+      const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get('s1') as { name: string; project_id: string };
+      expect(row.name).toBe('pre-existing session'); // pre-existing data survived the migration
+      expect(row.project_id).toBe('default'); // backfilled
+
+      const defaultProject = db.prepare('SELECT * FROM projects WHERE id = ?').get('default') as
+        | { id: string; name: string }
+        | undefined;
+      expect(defaultProject).toBeDefined();
+      expect(defaultProject?.name).toBe('Default');
+
+      // Re-opening an already-migrated file must not throw ("duplicate column").
+      db.close();
+      expect(() => openDb(path).close()).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('heals a partial sections_fts gap on reopen, not just a fully-empty table', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ct-fts-heal-'));
     const path = join(dir, 'heal.db');

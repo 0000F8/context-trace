@@ -10,3 +10,4 @@ data/
 *.log
 .playwright-mcp/
 *.png
+deploy/single-tenant/instances/

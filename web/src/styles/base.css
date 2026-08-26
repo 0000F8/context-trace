@@ -34,6 +34,12 @@ h3 {
   font-variant-numeric: tabular-nums;
 }
 
+/* Quiet mono placeholder for sections captured hash-only (no content shipped). */
+.hash-only-placeholder {
+  font-family: var(--font-mono);
+  color: var(--ink-2);
+}
+
 a {
   color: var(--focus);
 }
@@ -97,6 +103,12 @@ pre {
   letter-spacing: -0.01em;
   color: var(--ink);
   text-decoration: none;
+}
+
+.app-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .theme-toggle {

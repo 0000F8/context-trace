@@ -118,6 +118,8 @@ class ContextTraceClient:
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
         on_error: Optional[Callable[[Exception], None]] = None,
         enabled: bool = True,
+        content_mode: str = "full",
+        redact: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ):
         self._endpoint = endpoint.rstrip("/")
         # Reject anything but http(s) up front: this is a configuration
@@ -150,6 +152,12 @@ class ContextTraceClient:
         )
         self._on_error = on_error
         self._enabled = bool(enabled)
+        # Client-level defaults, overridable per segment (see
+        # SessionHandle.segment). Any value other than "hash_only" falls
+        # back to "full" rather than raising, mirroring the TS SDK's
+        # tolerant handling of an invalid contentMode.
+        self._content_mode = "hash_only" if content_mode == "hash_only" else "full"
+        self._redact = redact
 
         # Single lock guarding the queue and the session-handle cache (and,
         # via SessionHandle, each handle's own segment auto-counter) so the
@@ -479,6 +487,8 @@ class SessionHandle:
         model: Optional[str] = None,
         timestamp: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        content_mode: Optional[str] = None,
+        redact: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ) -> "SegmentBuilder":
         with self._client._lock:
             if index is not None:
@@ -490,8 +500,26 @@ class SessionHandle:
                 self._segment_counter += 1
         seg_id = id or generate_id("seg")
         ts = timestamp or _now_iso()
+        # Per-segment override wins in both directions: an explicit
+        # content_mode/redact here replaces the client default entirely for
+        # this segment, rather than merging with it.
+        effective_content_mode = (
+            self._client._content_mode if content_mode is None else content_mode
+        )
+        effective_content_mode = "hash_only" if effective_content_mode == "hash_only" else "full"
+        effective_redact = self._client._redact if redact is None else redact
         return SegmentBuilder(
-            self._client, self.id, seg_id, idx, kind, ts, label, model, metadata
+            self._client,
+            self.id,
+            seg_id,
+            idx,
+            kind,
+            ts,
+            label,
+            model,
+            metadata,
+            effective_content_mode,
+            effective_redact,
         )
 
     def end(self, ended_at: Optional[str] = None) -> None:
@@ -520,6 +548,8 @@ class SegmentBuilder:
         label: Optional[str],
         model: Optional[str],
         metadata: Optional[Dict[str, Any]],
+        content_mode: str = "full",
+        redact: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ):
         self._client = client
         self._session_id = session_id
@@ -530,6 +560,8 @@ class SegmentBuilder:
         self._label = label
         self._model = model
         self._metadata = metadata
+        self._content_mode = content_mode
+        self._redact = redact
         self._lock = threading.Lock()
         self._sections: List[Dict[str, Any]] = []
         self._recorded = False
@@ -553,6 +585,43 @@ class SegmentBuilder:
                         )
                     )
                     return self
+
+                if self._redact is not None:
+                    section_input: Dict[str, Any] = {
+                        "key": key,
+                        "service": service,
+                        "service_kind": service_kind,
+                        "role": role,
+                        "content": content,
+                        "tokens": tokens,
+                        "metadata": metadata,
+                    }
+                    try:
+                        result = self._redact(section_input)
+                    except Exception as err:
+                        # Fail closed: never ship content a failing redactor
+                        # was meant to scrub. Drop the section entirely
+                        # instead of falling back to the pre-redaction input.
+                        self._client._report_error(
+                            Exception(
+                                f'context-trace: redact() raised for section "{key}" on '
+                                f"segment {self.id}; dropping the section (fail closed): {err}"
+                            )
+                        )
+                        return self
+                    if result is None:
+                        return self  # dropped; position stays contiguous
+                    key = result.get("key", key)
+                    service = result.get("service", service)
+                    service_kind = result.get("service_kind", service_kind)
+                    role = result.get("role", role)
+                    content = result.get("content", content)
+                    tokens = result.get("tokens", tokens)
+                    metadata = result.get("metadata", metadata)
+
+                # contentHash and tokens are always derived from the real
+                # (redacted) content, computed before any hash-only
+                # stripping below.
                 content_hash = fnv1a64(content or "")
                 tok = tokens if tokens is not None else estimate_tokens(content or "")
                 section: Dict[str, Any] = {
@@ -565,7 +634,7 @@ class SegmentBuilder:
                 }
                 if role is not None:
                     section["role"] = role
-                if content is not None:
+                if content is not None and self._content_mode != "hash_only":
                     section["content"] = content
                 if metadata is not None:
                     section["metadata"] = metadata
@@ -656,7 +725,12 @@ class SegmentBuilder:
                 )
                 return
             outcome_data: Dict[str, Any] = {}
-            if response_text is not None:
+            # responseText is model output, exactly as sensitive as section
+            # content, and withheld the same way in hash_only mode. `error`
+            # is deliberately NOT stripped: provider error strings can't be
+            # hashed usefully the way content can, and scrubbing them is the
+            # caller's responsibility (see README).
+            if response_text is not None and self._content_mode != "hash_only":
                 outcome_data["responseText"] = response_text
             if latency_ms is not None:
                 outcome_data["latencyMs"] = latency_ms
