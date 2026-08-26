@@ -385,6 +385,10 @@ function buildSessionSummary(db: Db, row: SessionRow): SessionSummary {
   };
 }
 
+export function sessionExists(db: Db, id: string): boolean {
+  return Boolean(db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(id));
+}
+
 export function getSessionSummary(db: Db, id: string): SessionSummary | undefined {
   const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
   if (!row) return undefined;
@@ -560,6 +564,14 @@ export interface SearchOptions {
   limit: number;
 }
 
+// Snippet highlight markers, pinned to control chars U+0001/U+0002 (not literal '[' /
+// ']') so attacker-controlled section content can't inject characters that spoof a
+// highlight boundary in the rendered snippet. Built via fromCharCode so no transport
+// step can silently mangle them. The web client's snippet parser (web/src/lib/snippet.ts)
+// is pinned to these same exact codepoints.
+export const SNIPPET_MARK_OPEN = String.fromCharCode(1);
+export const SNIPPET_MARK_CLOSE = String.fromCharCode(2);
+
 /**
  * Full-text search over section content. `q` is passed as a bound parameter but still
  * wrapped as a quoted FTS5 phrase (embedded `"` doubled) so that FTS query-syntax
@@ -573,7 +585,7 @@ export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
     .prepare(
       `SELECT f.session_id AS session_id, s.name AS session_name, f.segment_index AS segment_index,
               f.key AS key, f.service AS service,
-              snippet(sections_fts, 0, '[', ']', '…', 12) AS snippet
+              snippet(sections_fts, 0, '${SNIPPET_MARK_OPEN}', '${SNIPPET_MARK_CLOSE}', '…', 12) AS snippet
        FROM sections_fts f
        JOIN sessions s ON s.id = f.session_id
        WHERE sections_fts MATCH ?

@@ -7,6 +7,7 @@ import { assignServiceColors, deriveServiceOrder } from '../lib/colors';
 import {
   alignStrata,
   buildHeadlineMetrics,
+  formatDeltaPercent,
   formatMetricDelta,
   formatMetricValue,
   unionServiceShareRows,
@@ -155,21 +156,17 @@ function ComparisonView({
               </tr>
             </thead>
             <tbody>
-              {shareRows.map((row) => {
-                const judgment = row.deltaPoints === 0 ? 'neutral' : row.deltaPoints < 0 ? 'good' : 'bad';
-                return (
-                  <tr key={row.name}>
-                    <td>
-                      <ServiceChip name={row.name} color={colorMap.get(row.name) ?? '#0F6B62'} />
-                    </td>
-                    <td className="mono">{(row.shareA * 100).toFixed(1)}%</td>
-                    <td className="mono">{(row.shareB * 100).toFixed(1)}%</td>
-                    <td className={`mono compare-metrics__delta compare-metrics__delta--${judgment}`}>
-                      {row.deltaPoints === 0 ? '±0.0pp' : `${row.deltaPoints > 0 ? '+' : ''}${row.deltaPoints.toFixed(1)}pp`}
-                    </td>
-                  </tr>
-                );
-              })}
+              {shareRows.map((row) => (
+                <tr key={row.name}>
+                  <td>
+                    <ServiceChip name={row.name} color={colorMap.get(row.name) ?? '#0F6B62'} />
+                  </td>
+                  <td className="mono">{(row.shareA * 100).toFixed(1)}%</td>
+                  <td className="mono">{(row.shareB * 100).toFixed(1)}%</td>
+                  {/* Shares sum to 1, so a shift here is redistribution, not improvement/regression — no judgment color. */}
+                  <td className="mono">{formatDeltaPercent(row.deltaPoints)}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         )}

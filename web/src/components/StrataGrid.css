@@ -74,12 +74,6 @@
   fill: var(--ink);
 }
 
-.strata-grid__axis-label {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  fill: var(--ink-2);
-}
-
 .strata-grid g.is-dimmed {
   opacity: 0.3;
 }

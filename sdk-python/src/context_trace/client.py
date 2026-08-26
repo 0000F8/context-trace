@@ -10,11 +10,12 @@ raises into the host app; failures are reported only via the ``on_error``
 callback passed to the constructor.
 """
 
+import atexit
 import json
 import math
 import threading
-import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -28,7 +29,9 @@ _DEFAULT_MAX_QUEUE = 5000
 _DEFAULT_MAX_SESSIONS = 1000
 _MAX_SEND_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.2  # 200ms, 400ms for attempts 1 and 2 (3 attempts total)
-_REQUEST_TIMEOUT_SECONDS = 10
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+_DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 5.0
+_DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SECONDS = 5.0
 
 
 def _now_iso() -> str:
@@ -68,17 +71,36 @@ class IngestHttpError(Exception):
 
 
 def _is_retryable(err: BaseException) -> bool:
-    """408 (timeout) and 429 (rate limit) are retryable; other 4xx are not
-    (won't succeed on retry); 5xx and network errors are retryable."""
+    """408 (timeout) and 429 (rate limit) are retryable; 5xx and network
+    errors are retryable. Everything else — other 4xx, and 3xx (redirects,
+    which we refuse to follow; see _NoRedirectHandler) — is treated as a
+    permanent failure that won't succeed by hitting the same endpoint
+    again."""
     if isinstance(err, IngestHttpError):
         if err.status in (408, 429):
             return True
-        return err.status < 400 or err.status >= 500
+        return err.status >= 500
     return True
 
 
 def _backoff_delay(attempt: int) -> float:
     return _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    Refuses to follow HTTP redirects for ingest requests. urllib's default
+    opener transparently follows 3xx responses *and forwards all original
+    request headers to the new location* — including the `x-api-key`
+    header — even when the redirect target is a different scheme, host, or
+    port. A malicious or misconfigured endpoint could use that to exfiltrate
+    the API key. A trace sink has no legitimate reason to redirect, so
+    treat any 3xx as an explicit, non-retryable failure instead of quietly
+    completing the request against an unintended host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
 class ContextTraceClient:
@@ -93,10 +115,26 @@ class ContextTraceClient:
         max_batch: int = 100,
         max_queue: int = 5000,
         max_sessions: int = 1000,
+        request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
         on_error: Optional[Callable[[Exception], None]] = None,
         enabled: bool = True,
     ):
         self._endpoint = endpoint.rstrip("/")
+        # Reject anything but http(s) up front: this is a configuration
+        # error, not a runtime capture failure, so it raises immediately
+        # rather than being silently sanitized like the numeric options
+        # below. In particular this blocks file:// and ftp:// endpoints,
+        # which urllib would otherwise happily "POST" to with surprising
+        # (and in file://'s case, locally dangerous) results.
+        scheme = urllib.parse.urlsplit(self._endpoint).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                f"context-trace: endpoint must start with 'http://' or 'https://' (got {endpoint!r})"
+            )
+        # A dedicated opener that never follows redirects — see
+        # _NoRedirectHandler for why. Built once and reused for every
+        # request rather than per-call.
+        self._opener = urllib.request.build_opener(_NoRedirectHandler)
         self._api_key = api_key
         self._flush_interval = _sanitize_float_option(
             flush_interval, _DEFAULT_FLUSH_INTERVAL_SECONDS, 0
@@ -104,6 +142,12 @@ class ContextTraceClient:
         self._max_batch = _sanitize_int_option(max_batch, _DEFAULT_MAX_BATCH, 1)
         self._max_queue = _sanitize_int_option(max_queue, _DEFAULT_MAX_QUEUE, 1)
         self._max_sessions = _sanitize_int_option(max_sessions, _DEFAULT_MAX_SESSIONS, 1)
+        # Per-request socket timeout passed to urlopen. Keeps a single hung
+        # HTTP call bounded so shutdown() (which allows only one attempt per
+        # batch — see _send_with_retry) can't be stuck on it indefinitely.
+        self._request_timeout = _sanitize_float_option(
+            request_timeout, _DEFAULT_REQUEST_TIMEOUT_SECONDS, 0.001
+        )
         self._on_error = on_error
         self._enabled = bool(enabled)
 
@@ -118,9 +162,18 @@ class ContextTraceClient:
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._shutdown_done = False
+        self._atexit_registered = False
         if self._enabled and self._flush_interval > 0:
             self._thread = threading.Thread(target=self._run_flusher, daemon=True)
             self._thread.start()
+        if self._enabled:
+            # Best-effort safety net for processes that exit without ever
+            # calling shutdown()/flush() explicitly. Bounded and idempotent
+            # — see _atexit_flush. Not a delivery guarantee: atexit hooks
+            # don't run on os._exit(), SIGKILL, or a hard crash.
+            atexit.register(self._atexit_flush)
+            self._atexit_registered = True
 
     # -- internal helpers ---------------------------------------------------
 
@@ -225,13 +278,29 @@ class ContextTraceClient:
         for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
             try:
                 parsed = self._send(batch)
-                self._report_partial_rejections(parsed, batch)
-                return
             except Exception as err:
-                if attempt >= _MAX_SEND_ATTEMPTS or not _is_retryable(err):
+                # `_stop_event` is checked here (not just at the top of the
+                # loop) so a shutdown() in progress aborts the ladder right
+                # after the attempt that's already in flight completes,
+                # instead of sleeping through a full backoff step first.
+                if (
+                    attempt >= _MAX_SEND_ATTEMPTS
+                    or not _is_retryable(err)
+                    or self._stop_event.is_set()
+                ):
                     self._report_error(err)
                     return
-                time.sleep(_backoff_delay(attempt))
+                # stop_event.wait() doubles as an interruptible sleep: it
+                # returns immediately once shutdown() sets the event,
+                # instead of blocking through the rest of the backoff delay.
+                self._stop_event.wait(_backoff_delay(attempt))
+                continue
+            # Response-body parsing happens outside the retried section: a
+            # malformed 'rejected' payload must never be mistaken for a
+            # send failure, which would otherwise trigger a retry that
+            # re-POSTs a batch the server already accepted.
+            self._safe_report_partial_rejections(parsed, batch)
+            return
 
     def _send(self, batch: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         body = json.dumps({"events": batch}).encode("utf-8")
@@ -244,7 +313,11 @@ class ContextTraceClient:
         if self._api_key:
             req.add_header("x-api-key", self._api_key)
         try:
-            with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_SECONDS) as resp:
+            # Use the dedicated no-redirect opener (see _NoRedirectHandler)
+            # rather than the module-level urllib.request.urlopen, whose
+            # default opener follows 3xx responses and forwards the
+            # x-api-key header to wherever they point.
+            with self._opener.open(req, timeout=self._request_timeout) as resp:
                 status = resp.getcode()
                 raw = resp.read()
         except urllib.error.HTTPError as err:
@@ -262,6 +335,14 @@ class ContextTraceClient:
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return None
+
+    def _safe_report_partial_rejections(
+        self, parsed: Optional[Dict[str, Any]], batch: List[Dict[str, Any]]
+    ) -> None:
+        try:
+            self._report_partial_rejections(parsed, batch)
+        except Exception as err:
+            self._report_error(err)
 
     def _report_partial_rejections(
         self, parsed: Optional[Dict[str, Any]], batch: List[Dict[str, Any]]
@@ -290,15 +371,95 @@ class ContextTraceClient:
             )
         )
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self,
+        join_timeout: float = _DEFAULT_SHUTDOWN_JOIN_TIMEOUT_SECONDS,
+        flush_timeout: float = _DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
+    ) -> None:
+        """
+        Stop the background flusher thread, then perform one bounded
+        best-effort flush. Signals `_stop_event` first so the retry ladder
+        in `_send_with_retry` (background thread or this final flush)
+        aborts after its current attempt instead of working through the
+        full 3-attempt/backoff sequence — this is what keeps shutdown()
+        from blocking for tens of seconds against a slow/hanging endpoint.
+        It can still take up to roughly `join_timeout` + one in-flight
+        request (bounded by `request_timeout`), since a request already in
+        progress when shutdown() is called can't be interrupted mid-flight.
+        """
         try:
             self._stop_event.set()
             if self._thread is not None:
-                self._thread.join(timeout=5)
-                self._thread = None
-            self.flush()
+                self._thread.join(timeout=join_timeout)
+                if self._thread.is_alive():
+                    # Still running (almost certainly blocked on a slow
+                    # request past join_timeout) — don't null the
+                    # reference, since that would misreport the thread as
+                    # stopped to anything checking it.
+                    self._report_error(
+                        Exception(
+                            "context-trace: background flush thread did not stop within "
+                            f"{join_timeout}s (a request may still be in flight)"
+                        )
+                    )
+                else:
+                    self._thread = None
+            self._shutdown_flush(flush_timeout)
         except Exception as err:
             self._report_error(err)
+        finally:
+            self._shutdown_done = True
+            if self._atexit_registered:
+                try:
+                    atexit.unregister(self._atexit_flush)
+                except Exception:
+                    pass
+
+    def _shutdown_flush(self, timeout: float) -> None:
+        """
+        Best-effort final drain: bounded by `timeout` when acquiring the
+        shared flush lock, in case the background thread is still mid-drain
+        against a slow endpoint (its in-flight request can't be canceled,
+        only waited out or abandoned). If the lock can't be acquired in
+        time, this reports and returns rather than blocking — queued events
+        are left for a future flush() rather than guaranteed delivered.
+        """
+        if not self._enabled:
+            return
+        acquired = self._flush_lock.acquire(timeout=timeout)
+        if not acquired:
+            self._report_error(
+                Exception(
+                    "context-trace: shutdown flush skipped; a previous flush is still "
+                    "in progress against a slow endpoint"
+                )
+            )
+            return
+        try:
+            self._drain()
+        except Exception as err:
+            self._report_error(err)
+        finally:
+            self._flush_lock.release()
+
+    def _atexit_flush(self) -> None:
+        """
+        Registered via atexit at construction time (when enabled): a
+        bounded, best-effort safety net so queued events aren't silently
+        lost just because the host process exited without calling
+        shutdown()/flush() explicitly. Idempotent — a prior explicit
+        shutdown() unregisters this, and this itself only runs once.
+        Deliberately never raises: the interpreter is already tearing down.
+        """
+        if self._shutdown_done:
+            return
+        try:
+            self._stop_event.set()
+            self._shutdown_flush(_DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        finally:
+            self._shutdown_done = True
 
 
 class SessionHandle:

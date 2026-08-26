@@ -19,6 +19,16 @@ const MAX_SECTIONS_PER_SEGMENT = 500;
 const MAX_OUTCOME_RESPONSE_LEN = 262_144;
 const MAX_OUTCOME_ERROR_LEN = 4_096;
 const MAX_OUTCOME_SCORE_KEYS = 32;
+const MAX_METADATA_JSON_BYTES = 64 * 1024;
+// Deliberately NOT 64KB: responseText alone is already spec'd up to 262144 chars, and
+// with every character requiring JSON escaping (e.g. all `"`), a fully spec-compliant
+// outcome (every field at its own individual cap) serializes to ~550KB. This cap exists
+// as a safety net for fields that don't already have a tight per-field cap (or a future
+// field that's missing one) — sized comfortably above that legitimate worst case so it
+// never rejects a spec-compliant outcome, while still catching gross abuse (e.g. the
+// reported multi-MB outcome.model, which the per-field cap above now also rejects
+// directly).
+const MAX_OUTCOME_JSON_BYTES = 600 * 1024;
 const SSE_HEARTBEAT_MS = 25_000;
 
 const SESSION_KINDS = new Set(['llm_call', 'turn', 'custom']);
@@ -40,6 +50,25 @@ export interface AppOptions {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Caps the serialized size of a metadata/outcome blob. These are stored as opaque JSON
+ * and re-serialized on every read; a type check alone (`is this an object?`) doesn't
+ * bound size, so an attacker-controlled multi-MB value would otherwise sail straight
+ * through and balloon every subsequent read response.
+ */
+function validateJsonSize(value: unknown, maxBytes: number, label: string): string | null {
+  const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+  if (bytes > maxBytes) return `${label} exceeds max serialized size of ${maxBytes} bytes`;
+  return null;
+}
+
+/** Validates an optional `metadata` field shared by session/segment/section payloads. */
+function validateMetadataField(metadata: unknown, label: string): string | null {
+  if (metadata === undefined) return null;
+  if (!isRecord(metadata)) return `${label} must be an object`;
+  return validateJsonSize(metadata, MAX_METADATA_JSON_BYTES, label);
 }
 
 /** Validates a `sections` array shared by segment.recorded and /v1/import. */
@@ -79,8 +108,30 @@ function validateSectionsArray(sections: unknown): string | null {
     if (section.tokens !== undefined && typeof section.tokens !== 'number') {
       return `sections[${i}].tokens must be a number`;
     }
+    const metadataReason = validateMetadataField(section.metadata, `sections[${i}].metadata`);
+    if (metadataReason) return metadataReason;
   }
 
+  return null;
+}
+
+/** Validates a `Session` payload — shared by the session.started ingest event and /v1/import. */
+function validateSessionPayload(data: unknown): string | null {
+  if (!isRecord(data)) return 'session must be an object';
+  if (typeof data.id !== 'string' || data.id.length === 0) return 'session.id is required';
+  if (data.id.length > MAX_STRING_LEN) return 'session.id exceeds max length';
+  if (typeof data.name !== 'string' || data.name.length === 0) return 'session.name is required';
+  if (data.name.length > MAX_STRING_LEN) return 'session.name exceeds max length';
+  if (data.agent !== undefined && typeof data.agent !== 'string') return 'session.agent must be a string';
+  if (typeof data.agent === 'string' && data.agent.length > MAX_STRING_LEN) return 'session.agent exceeds max length';
+  const metadataReason = validateMetadataField(data.metadata, 'session.metadata');
+  if (metadataReason) return metadataReason;
+  if (typeof data.startedAt !== 'string' || data.startedAt.length === 0) return 'session.startedAt is required';
+  if (data.startedAt.length > MAX_STRING_LEN) return 'session.startedAt exceeds max length';
+  if (data.endedAt !== undefined) {
+    if (typeof data.endedAt !== 'string') return 'session.endedAt must be a string';
+    if (data.endedAt.length > MAX_STRING_LEN) return 'session.endedAt exceeds max length';
+  }
   return null;
 }
 
@@ -98,6 +149,8 @@ function validateSegmentPayload(data: unknown): string | null {
   }
   if (typeof data.kind !== 'string' || !SESSION_KINDS.has(data.kind)) return 'segment.kind is invalid';
   if (typeof data.timestamp !== 'string' || data.timestamp.length === 0) return 'segment.timestamp is required';
+  const metadataReason = validateMetadataField(data.metadata, 'segment.metadata');
+  if (metadataReason) return metadataReason;
   return validateSectionsArray(data.sections);
 }
 
@@ -119,15 +172,23 @@ function validateOutcomePayload(outcome: unknown): string | null {
   if (outcome.latencyMs !== undefined && typeof outcome.latencyMs !== 'number') {
     return 'outcome.latencyMs must be a number';
   }
-  if (outcome.model !== undefined && typeof outcome.model !== 'string') return 'outcome.model must be a string';
+  if (outcome.model !== undefined) {
+    if (typeof outcome.model !== 'string') return 'outcome.model must be a string';
+    if (outcome.model.length > MAX_STRING_LEN) return `outcome.model exceeds max length of ${MAX_STRING_LEN}`;
+  }
   if (outcome.scores !== undefined) {
     if (!isRecord(outcome.scores)) return 'outcome.scores must be an object';
     const keys = Object.keys(outcome.scores);
     if (keys.length > MAX_OUTCOME_SCORE_KEYS) return `outcome.scores exceeds max of ${MAX_OUTCOME_SCORE_KEYS} score keys`;
     for (const k of keys) {
+      if (k.length > MAX_STRING_LEN) return `outcome.scores key exceeds max length of ${MAX_STRING_LEN}`;
       if (typeof (outcome.scores as Record<string, unknown>)[k] !== 'number') return `outcome.scores.${k} must be a number`;
     }
   }
+  // Defense in depth on top of the per-field caps above: bounds the whole serialized
+  // blob, since it's stored and re-serialized as one opaque JSON column.
+  const sizeReason = validateJsonSize(outcome, MAX_OUTCOME_JSON_BYTES, 'outcome');
+  if (sizeReason) return sizeReason;
   return null;
 }
 
@@ -142,14 +203,7 @@ function validateEvent(raw: unknown): string | null {
   if (!isRecord(data)) return 'event.data must be an object';
 
   if (type === 'session.started') {
-    if (typeof data.id !== 'string' || data.id.length === 0) return 'session.id is required';
-    if (data.id.length > MAX_STRING_LEN) return 'session.id exceeds max length';
-    if (typeof data.name !== 'string' || data.name.length === 0) return 'session.name is required';
-    if (data.name.length > MAX_STRING_LEN) return 'session.name exceeds max length';
-    if (data.agent !== undefined && typeof data.agent !== 'string') return 'session.agent must be a string';
-    if (typeof data.agent === 'string' && data.agent.length > MAX_STRING_LEN) return 'session.agent exceeds max length';
-    if (typeof data.startedAt !== 'string' || data.startedAt.length === 0) return 'session.startedAt is required';
-    return null;
+    return validateSessionPayload(data);
   }
 
   if (type === 'session.ended') {
@@ -188,26 +242,55 @@ function applyEvent(db: Db, event: IngestEvent): void {
   }
 }
 
-/** Emits the corresponding live-tail bus message for a successfully-applied event. */
+function liveSessionIdFor(event: IngestEvent): string {
+  return event.type === 'session.started' ? event.data.id : event.data.sessionId;
+}
+
+/**
+ * Emits the corresponding live-tail bus message for a successfully-applied event.
+ * Bails out before touching the DB when nobody is listening on this session — building
+ * a `segment` message means a full-content select + diff (measured ~3.6ms/event), which
+ * is wasted work on every single ingest event for the overwhelmingly common case of no
+ * open /live connection.
+ */
 function emitLiveEvents(db: Db, bus: SessionBus, event: IngestEvent): void {
-  if (event.type === 'session.started') {
-    const summary = store.getSessionSummary(db, event.data.id);
-    if (summary) bus.emit(event.data.id, { event: 'session', data: summary });
-  } else if (event.type === 'session.ended') {
-    const summary = store.getSessionSummary(db, event.data.sessionId);
-    if (summary) bus.emit(event.data.sessionId, { event: 'session', data: summary });
+  const sessionId = liveSessionIdFor(event);
+  if (bus.listenerCount(sessionId) === 0) return;
+
+  if (event.type === 'session.started' || event.type === 'session.ended') {
+    const summary = store.getSessionSummary(db, sessionId);
+    if (summary) bus.emit(sessionId, { event: 'session', data: summary });
   } else if (event.type === 'segment.recorded') {
-    const detail = store.getSegmentDetail(db, event.data.sessionId, event.data.index);
-    if (detail) bus.emit(event.data.sessionId, { event: 'segment', data: detail.segment });
+    const detail = store.getSegmentDetail(db, sessionId, event.data.index);
+    if (detail) bus.emit(sessionId, { event: 'segment', data: detail.segment });
   } else if (event.type === 'segment.outcome') {
-    const index = store.getSegmentIndexById(db, event.data.sessionId, event.data.segmentId);
+    const index = store.getSegmentIndexById(db, sessionId, event.data.segmentId);
     if (index !== undefined) {
-      bus.emit(event.data.sessionId, {
-        event: 'outcome',
-        data: { segmentId: event.data.segmentId, index, outcome: event.data.outcome },
-      });
+      bus.emit(sessionId, { event: 'outcome', data: { segmentId: event.data.segmentId, index, outcome: event.data.outcome } });
     }
   }
+}
+
+/** Percent-encodes a string per RFC 5987 `attr-char`, for a `filename*=` extended value. */
+function encodeRfc5987ValueChars(value: string): string {
+  return encodeURIComponent(value)
+    .replace(/['()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+    .replace(/\*/g, '%2A');
+}
+
+/**
+ * Builds a `content-disposition` header value that can't be used for header/CRLF
+ * injection: session ids are attacker-controlled (client-assigned), and neither the
+ * quoted `filename` nor the header as a whole may contain raw `"`, `;`, CR, or LF from
+ * that id. The quoted `filename` is reduced to a conservative ASCII-safe charset (any
+ * other character, including quotes/semicolons/CR/LF, becomes '_'); the real id
+ * (unicode included) is carried in the RFC 5987 `filename*` extension instead, which is
+ * percent-encoded and so can't contain a literal CR/LF either.
+ */
+function exportContentDisposition(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9._-]/g, '_') || 'export';
+  const encoded = encodeRfc5987ValueChars(id);
+  return `attachment; filename="${safe}.context-trace.json"; filename*=UTF-8''${encoded}.context-trace.json`;
 }
 
 function clampInt(raw: string | undefined, fallback: number, min: number, max: number): number {
@@ -351,7 +434,7 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
     const id = c.req.param('id');
     const exported = store.exportSession(db, id);
     if (!exported) return c.json({ error: 'not found' }, 404);
-    c.header('content-disposition', `attachment; filename="${id}.context-trace.json"`);
+    c.header('content-disposition', exportContentDisposition(id));
     return c.json(exported);
   });
 
@@ -365,6 +448,10 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
 
   app.get('/v1/sessions/:id/live', (c) => {
     const sessionId = c.req.param('id');
+    // A session that doesn't exist yet (e.g. session.started hasn't arrived) is a
+    // legitimate 404 rather than a stream that silently sits open forever — clients
+    // should open /live only after the session is known to exist.
+    if (!store.sessionExists(db, sessionId)) return c.json({ error: 'not found' }, 404);
     return streamSSE(c, async (stream) => {
       let closed = false;
       const unsubscribe = bus.subscribe(sessionId, (msg) => {
@@ -408,15 +495,8 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
       if (body.version !== 1) return c.json({ error: 'unsupported version' }, 400);
 
       const session = body.session;
-      if (!isRecord(session) || typeof session.id !== 'string' || session.id.length === 0) {
-        return c.json({ error: 'session.id is required' }, 400);
-      }
-      if (typeof session.name !== 'string' || session.name.length === 0) {
-        return c.json({ error: 'session.name is required' }, 400);
-      }
-      if (typeof session.startedAt !== 'string' || session.startedAt.length === 0) {
-        return c.json({ error: 'session.startedAt is required' }, 400);
-      }
+      const sessionReason = validateSessionPayload(session);
+      if (sessionReason) return c.json({ error: `session: ${sessionReason}` }, 400);
 
       const segmentsRaw = body.segments;
       if (!Array.isArray(segmentsRaw)) return c.json({ error: 'segments must be an array' }, 400);
@@ -424,25 +504,54 @@ export function createApp(db: Db, opts: AppOptions = {}): Hono {
         return c.json({ error: `segments exceeds max size of ${MAX_BATCH}` }, 400);
       }
 
+      const sessionId = (session as Record<string, unknown>).id as string;
       for (let i = 0; i < segmentsRaw.length; i++) {
         const seg = segmentsRaw[i];
         const reason = validateSegmentPayload(seg);
         if (reason) return c.json({ error: `segments[${i}]: ${reason}` }, 400);
+        // An import envelope carries exactly one session; a segment claiming a
+        // different sessionId would otherwise let one exported file write into (or
+        // hijack) an unrelated session.
+        if (isRecord(seg) && seg.sessionId !== sessionId) {
+          return c.json({ error: `segments[${i}]: sessionId must match the imported session's id` }, 400);
+        }
         if (isRecord(seg) && seg.outcome !== undefined) {
           const outcomeReason = validateOutcomePayload(seg.outcome);
           if (outcomeReason) return c.json({ error: `segments[${i}].outcome: ${outcomeReason}` }, 400);
         }
       }
 
-      store.upsertSession(db, session as unknown as Session);
-      for (const seg of segmentsRaw as Array<Record<string, unknown>>) {
-        store.upsertSegment(db, seg as unknown as SegmentWithSections);
-        if (seg.outcome !== undefined) {
-          store.applySegmentOutcome(db, seg.sessionId as string, seg.id as string, seg.outcome as SegmentOutcome);
-        }
-      }
-      if (typeof session.endedAt === 'string' && session.endedAt.length > 0) {
-        store.endSession(db, session.id, session.endedAt);
+      // Everything below is one atomic write: a failure partway through (e.g. two
+      // segments that pass schema validation individually but collide on the
+      // (session_id, idx) unique constraint) must leave nothing written, not a
+      // half-imported session. store.upsertSegment's own internal transaction nests as
+      // a savepoint here (better-sqlite3 supports this natively), so a failure inside it
+      // still rolls back everything from this outer transaction, including segments
+      // already committed earlier in the loop.
+      let failingLabel: string | undefined;
+      try {
+        const importTx = db.transaction(() => {
+          failingLabel = 'session';
+          store.upsertSession(db, session as unknown as Session);
+          const segments = segmentsRaw as Array<Record<string, unknown>>;
+          for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i]!;
+            failingLabel = `segments[${i}]`;
+            store.upsertSegment(db, seg as unknown as SegmentWithSections);
+            if (seg.outcome !== undefined) {
+              store.applySegmentOutcome(db, seg.sessionId as string, seg.id as string, seg.outcome as SegmentOutcome);
+            }
+          }
+          failingLabel = undefined;
+          const s = session as Record<string, unknown>;
+          if (typeof s.endedAt === 'string' && s.endedAt.length > 0) {
+            store.endSession(db, s.id as string, s.endedAt);
+          }
+        });
+        importTx();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : 'unknown error';
+        return c.json({ error: `import failed at ${failingLabel ?? 'session'}: ${reason}` }, 400);
       }
 
       return c.json({ accepted: { segments: segmentsRaw.length } }, 200);

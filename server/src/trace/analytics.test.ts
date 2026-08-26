@@ -78,6 +78,24 @@ describe('computeAnalytics', () => {
       expect(analytics.window).toBeUndefined();
       expect(analytics.perSegment[0]!.overWindow).toBe(false);
     });
+
+    it('treats a window of 0 or negative as unset rather than flagging everything over-window', () => {
+      const seg0 = segment({ id: 'w0', index: 0, sections: [section({ key: 'a', content: 'x'.repeat(50) })] });
+
+      const zero = computeAnalytics(compileTrace({ ...EMPTY_SUMMARY, metadata: { window: 0 } }, [seg0]));
+      expect(zero.window).toBeUndefined();
+      expect(zero.perSegment[0]!.overWindow).toBe(false);
+
+      const negative = computeAnalytics(compileTrace({ ...EMPTY_SUMMARY, metadata: { window: -100 } }, [seg0]));
+      expect(negative.window).toBeUndefined();
+      expect(negative.perSegment[0]!.overWindow).toBe(false);
+    });
+
+    it('ignores a non-positive window parameter fallback too', () => {
+      const seg0 = segment({ id: 'w1', index: 0, sections: [section({ key: 'a', content: 'x'.repeat(10) })] });
+      expect(computeAnalytics(compileTrace(EMPTY_SUMMARY, [seg0]), 0).window).toBeUndefined();
+      expect(computeAnalytics(compileTrace(EMPTY_SUMMARY, [seg0]), -5).window).toBeUndefined();
+    });
   });
 
   describe('thrash', () => {
@@ -98,6 +116,30 @@ describe('computeAnalytics', () => {
       const analyticsGap6 = computeAnalytics(compileTrace(EMPTY_SUMMARY, withGap6));
       expect(analyticsGap6.thrash).toEqual([]);
       expect(analyticsGap6.findings.some((f) => f.kind === 'thrash')).toBe(false);
+    });
+
+    it('does not report thrash for a key present in every actually-recorded segment, even with sparse indices', () => {
+      // Indices 0, 3, 6 (e.g. a client that allocates an index per turn but only records
+      // every third one) with the key present in all three real segments. Raw index
+      // subtraction would see gaps of 3 and manufacture phantom thrash; this must be zero.
+      const segs = [0, 3, 6].map((idx) => segment({ id: `s${idx}`, index: idx, sections: [section({ key: 'k', content: 'v' })] }));
+      const analytics = computeAnalytics(compileTrace(EMPTY_SUMMARY, segs));
+      expect(analytics.thrash).toEqual([]);
+      expect(analytics.findings.some((f) => f.kind === 'thrash')).toBe(false);
+    });
+
+    it('flags a genuine removal/re-add measured by position in the actual sequence, not raw index difference', () => {
+      // Real segments exist at indices 0, 3, 6, 9. The key is present at 0, 3, 9 and
+      // genuinely absent from the one real segment at index 6 — exactly one actually-
+      // recorded segment of absence, so gap must be 1 (not 9-3-1=5 from raw indices).
+      const segs = [
+        segment({ id: 'p0', index: 0, sections: [section({ key: 'k', content: 'v' })] }),
+        segment({ id: 'p3', index: 3, sections: [section({ key: 'k', content: 'v' })] }),
+        segment({ id: 'p6', index: 6, sections: [] }),
+        segment({ id: 'p9', index: 9, sections: [section({ key: 'k', content: 'v' })] }),
+      ];
+      const analytics = computeAnalytics(compileTrace(EMPTY_SUMMARY, segs));
+      expect(analytics.thrash).toEqual([{ key: 'k', service: 'svc', removedAt: 6, readdedAt: 9, gap: 1 }]);
     });
   });
 

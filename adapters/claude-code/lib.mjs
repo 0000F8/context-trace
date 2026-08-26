@@ -11,8 +11,40 @@
  */
 import { estimateTokens, fnv1a64 } from '../../packages/types/dist/index.js';
 
-/** Hard cap on the serialized transcript section — see spec §E2. */
+/** Hard per-section content cap (applied to every section built here, not just the transcript) — see spec §E2. */
 export const MAX_TRANSCRIPT_CHARS = 240_000;
+
+const SAFE_FILENAME_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Reduces an untrusted `session_id` to something safe to use as a
+ * filesystem path component. Claude Code's `session_id` is normally a UUID,
+ * but it arrives via a hook payload we don't control — a hand-crafted or
+ * corrupted value containing `/`, `..`, or other path metacharacters could
+ * otherwise let the counter file/lock escape the counter directory (path
+ * traversal) or collide with an unrelated file. Anything that isn't already
+ * composed only of safe characters is replaced wholesale (not
+ * escaped/stripped) by a stable hash of the original value, so the same
+ * unsafe id always maps to the same filename — preserving per-session
+ * counter continuity across hook invocations without ever emitting an
+ * unsafe path segment.
+ */
+export function sanitizeSessionIdForFilename(sessionId) {
+  if (typeof sessionId === 'string' && SAFE_FILENAME_RE.test(sessionId)) {
+    return sessionId;
+  }
+  return fnv1a64(typeof sessionId === 'string' ? sessionId : String(sessionId));
+}
+
+/**
+ * Cheap hardening on the hook payload's `transcript_path` before we read it:
+ * Claude Code always points this at a `.jsonl` transcript file, so rejecting
+ * anything else costs nothing and closes off reading an arbitrary file the
+ * hook payload happened to name.
+ */
+export function looksLikeTranscriptPath(path) {
+  return typeof path === 'string' && path.length > 0 && path.endsWith('.jsonl');
+}
 
 /**
  * Parses Claude Code's transcript JSONL format into a flat list of
@@ -76,10 +108,13 @@ export function parseTranscript(jsonlText) {
 
 /**
  * Builds the wire-shaped Section objects for one segment snapshot from a
- * parsed transcript: `hist:transcript` (the full serialized conversation,
- * capped at MAX_TRANSCRIPT_CHARS), `user:latest`, `assistant:latest`, and
- * `tool:<name>` for the most recent tool result, when present. Positions
- * are assigned in the order above.
+ * parsed transcript: `hist:transcript` (the full serialized conversation),
+ * `user:latest`, `assistant:latest`, and `tool:<name>` for the most recent
+ * tool result, when present. Positions are assigned in the order above.
+ * Every section's content is capped at MAX_TRANSCRIPT_CHARS (see
+ * `toSection`) — not just the transcript — so a single oversized message
+ * (a giant tool result, say) can't get the whole segment rejected
+ * server-side by the section content-size limit.
  */
 export function buildSections(parsed) {
   const sections = [];
@@ -89,7 +124,7 @@ export function buildSections(parsed) {
       key: 'hist:transcript',
       service: 'claude-code',
       serviceKind: 'history',
-      content: serializeTranscript(parsed.messages).slice(0, MAX_TRANSCRIPT_CHARS),
+      content: serializeTranscript(parsed.messages),
     }),
   );
 
@@ -133,7 +168,15 @@ export function buildSections(parsed) {
 }
 
 function toSection({ key, service, serviceKind, role, content }) {
-  const text = content ?? '';
+  // Keep the TAIL, not the head, when a section is over the cap: content
+  // here only grows across a session (the transcript, and any of these
+  // "latest" pointers can independently be huge — e.g. a giant tool
+  // result), so slicing from the front would freeze a section's content the
+  // moment it crosses the cap (every later turn truncates back to the same
+  // leading bytes), which reads to context-trace as a section that's
+  // present and unchanged forever — i.e. it would falsely trip the
+  // dead-weight finding. The tail is also the more useful half to see.
+  const text = (content ?? '').slice(-MAX_TRANSCRIPT_CHARS);
   return {
     key,
     service,

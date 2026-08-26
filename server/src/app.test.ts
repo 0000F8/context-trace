@@ -1,8 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Hono } from 'hono';
 import { fnv1a64 } from '@context-trace/types';
 import { createApp, getBus } from './app.js';
 import { openDb, setFtsSupport, type Db } from './db.js';
+import * as store from './store.js';
+import { SNIPPET_MARK_CLOSE, SNIPPET_MARK_OPEN } from './store.js';
 
 function baseUrl() {
   return 'http://localhost';
@@ -762,6 +764,57 @@ describe('app', () => {
       const segDetail = await (await app.request(`${baseUrl()}/v1/sessions/s1/segments/0`)).json();
       expect(segDetail.segment.outcome).toEqual({ latencyMs: 500 });
     });
+
+    it('rejects an oversized outcome.model and an oversized scores key, not just responseText/error', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+      const events = [
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { model: 'm'.repeat(513) } } },
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { model: 'm'.repeat(3_000_000) } } }, // the reported 3MB case
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { scores: { ['k'.repeat(513)]: 1 } } } },
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { model: 'm'.repeat(512) } } }, // at limit: accepted
+      ];
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ events }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(1);
+      expect(body.rejected).toEqual([
+        { index: 0, reason: 'outcome.model exceeds max length of 512' },
+        { index: 1, reason: 'outcome.model exceeds max length of 512' },
+        { index: 2, reason: 'outcome.scores key exceeds max length of 512' },
+      ]);
+    });
+
+    it('rejects an outcome whose overall serialized size is grossly oversized, even with individually-valid-looking fields', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+      // Many score keys near their own per-field cap, cumulatively far past any
+      // reasonable outcome size — each field alone might slip by a narrower check,
+      // but the aggregate is what actually balloons storage/read responses.
+      const scores: Record<string, number> = {};
+      for (let i = 0; i < 32; i++) scores[`k${i}`.padEnd(500, 'x')] = 0.5;
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            {
+              type: 'segment.outcome',
+              data: {
+                sessionId: 's1',
+                segmentId: 'seg-0',
+                outcome: { responseText: 'x'.repeat(262_144), error: 'x'.repeat(4_096), model: 'x'.repeat(512), scores },
+              },
+            },
+          ],
+        }),
+      });
+      const body = await res.json();
+      // Every individual field is within its own cap; the whole payload must still be accepted
+      // (this is the legitimate worst case, and must not be rejected by the aggregate cap).
+      expect(body.accepted).toBe(1);
+    });
   });
 
   describe('GET /v1/sessions/:id/trace/analytics', () => {
@@ -889,6 +942,48 @@ describe('app', () => {
         expect(bus.listenerCount('s1')).toBe(0);
       }
     });
+
+    it('returns 404 for /live on a session that does not exist yet', async () => {
+      const res = await app.request(`${baseUrl()}/v1/sessions/nope/live`);
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'not found' });
+      expect(getBus(app)!.listenerCount('nope')).toBe(0); // never subscribed
+    });
+  });
+
+  describe('emitLiveEvents perf guard', () => {
+    it('skips building a segment detail (full content select + diff) when nobody is listening', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+
+      const spy = vi.spyOn(store, 'getSegmentDetail');
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 0, sections: [{ key: 'a', content: 'hi' }] })],
+        }),
+      });
+      expect(spy).not.toHaveBeenCalled(); // no /live subscriber -> no detail built
+
+      const liveRes = await app.request(`${baseUrl()}/v1/sessions/s1/live`);
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [makeSegmentEvent({ id: 'seg-1', sessionId: 's1', index: 1, sections: [{ key: 'a', content: 'hi2' }] })],
+        }),
+      });
+      expect(spy).toHaveBeenCalledTimes(1); // now there is a subscriber
+
+      await liveRes.body!.getReader().cancel();
+      spy.mockRestore();
+    });
   });
 
   describe('GET /v1/search', () => {
@@ -922,7 +1017,10 @@ describe('app', () => {
         key: 'notes',
         service: 'svc',
       });
-      expect(body.hits[0].snippet).toContain('[');
+      expect(body.hits[0].snippet).toContain(SNIPPET_MARK_OPEN);
+      expect(body.hits[0].snippet).toContain(SNIPPET_MARK_CLOSE);
+      // Attacker-controlled content can't spoof a highlight boundary with plain brackets.
+      expect(body.hits[0].snippet).not.toContain('[');
     });
 
     it('treats FTS syntax characters in the query as a literal phrase instead of erroring', async () => {
@@ -984,7 +1082,9 @@ describe('app', () => {
       await seedExportableSession(app, 's1');
       const res = await app.request(`${baseUrl()}/v1/sessions/s1/export`);
       expect(res.status).toBe(200);
-      expect(res.headers.get('content-disposition')).toBe('attachment; filename="s1.context-trace.json"');
+      expect(res.headers.get('content-disposition')).toBe(
+        `attachment; filename="s1.context-trace.json"; filename*=UTF-8''s1.context-trace.json`
+      );
       const body = await res.json();
       expect(body.version).toBe(1);
       expect(body.session.id).toBe('s1');
@@ -994,6 +1094,52 @@ describe('app', () => {
 
     it('returns 404 exporting an unknown session', async () => {
       expect((await app.request(`${baseUrl()}/v1/sessions/nope/export`)).status).toBe(404);
+    });
+
+    describe('content-disposition header-injection safety', () => {
+      async function ingestSessionWithId(id: string) {
+        await app.request(`${baseUrl()}/v1/ingest`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            events: [{ type: 'session.started', data: { id, name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+          }),
+        });
+      }
+
+      it('sanitizes a session id containing quotes/semicolons instead of injecting header parameters', async () => {
+        const maliciousId = 's1";x="evil';
+        await ingestSessionWithId(maliciousId);
+
+        const res = await app.request(`${baseUrl()}/v1/sessions/${encodeURIComponent(maliciousId)}/export`);
+        expect(res.status).toBe(200);
+        const header = res.headers.get('content-disposition')!;
+        expect(header).not.toContain('x="evil');
+        expect(header).toMatch(/^attachment; filename="[A-Za-z0-9._-]+\.context-trace\.json"; filename\*=UTF-8''/);
+        // The real id is still recoverable from the RFC 5987 extended value.
+        expect(header).toContain(encodeURIComponent(maliciousId));
+      });
+
+      it('does not 500 on a session id containing CRLF, and the header carries no raw CRLF or unescaped colon', async () => {
+        const maliciousId = 's1\r\nX-Injected: true';
+        await ingestSessionWithId(maliciousId);
+
+        const res = await app.request(`${baseUrl()}/v1/sessions/${encodeURIComponent(maliciousId)}/export`);
+        expect(res.status).toBe(200);
+        const header = res.headers.get('content-disposition')!;
+        // No raw CR/LF anywhere — a fake header line can't be injected into the response.
+        expect(header).not.toMatch(/[\r\n]/);
+        // Letters from the id may survive as harmless sanitized text, but a raw ':' (which
+        // would start a new header field if a real CRLF preceded it) must not appear
+        // unescaped outside of the fixed "attachment; filename=..." structure.
+        expect(header).toBe(
+          `attachment; filename="s1__X-Injected__true.context-trace.json"; filename*=UTF-8''${encodeURIComponent(maliciousId)}.context-trace.json`
+        );
+
+        // Deterministic: re-exporting the same session must not "permanently" 500 either.
+        const res2 = await app.request(`${baseUrl()}/v1/sessions/${encodeURIComponent(maliciousId)}/export`);
+        expect(res2.status).toBe(200);
+      });
     });
 
     it('round-trips export -> delete -> import: the trace and outcomes match before and after', async () => {
@@ -1047,6 +1193,129 @@ describe('app', () => {
         body: JSON.stringify(exported),
       });
       expect(right.status).toBe(200);
+    });
+
+    function exportSegment(id: string, sessionId: string, index: number, sections: Array<{ key: string; content: string }>) {
+      return {
+        id,
+        sessionId,
+        index,
+        kind: 'llm_call' as const,
+        timestamp: new Date(2026, 0, 1, 0, index).toISOString(),
+        sections: sections.map((s, i) => ({
+          key: s.key,
+          service: 'svc',
+          serviceKind: 'memory' as const,
+          position: i,
+          content: s.content,
+          contentHash: fnv1a64(s.content),
+          tokens: s.content.length,
+        })),
+      };
+    }
+
+    it('rolls back the entire import atomically when a later segment collides on (session_id, idx) — nothing is written', async () => {
+      const res = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 1,
+          session: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() },
+          segments: [
+            exportSegment('seg-a', 's1', 0, [{ key: 'a', content: 'x' }]),
+            exportSegment('seg-b', 's1', 0, [{ key: 'a', content: 'y' }]), // duplicate idx=0 for the same session
+          ],
+        }),
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/segments\[1\]/);
+      expect(res.status).not.toBe(500);
+
+      // Nothing was written — not even the session itself, and not the first segment,
+      // which would previously have committed on its own before the second one failed.
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1`)).status).toBe(404);
+    });
+
+    it('rejects an import segment whose sessionId does not match the imported session (cannot write into an unrelated session)', async () => {
+      // A victim session already exists with one segment.
+      await seedExportableSession(app, 'victim');
+      const before = await (await app.request(`${baseUrl()}/v1/sessions/victim`)).json();
+
+      const res = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 1,
+          session: { id: 'attacker-session', name: 'attacker', startedAt: new Date(2026, 0, 1).toISOString() },
+          segments: [exportSegment('injected-seg', 'victim', 99, [{ key: 'a', content: 'hijacked' }])],
+        }),
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/segments\[0\]/);
+      expect(body.error).toMatch(/sessionId must match/);
+
+      // The victim session must be completely unaffected.
+      const after = await (await app.request(`${baseUrl()}/v1/sessions/victim`)).json();
+      expect(after).toEqual(before);
+      expect((await app.request(`${baseUrl()}/v1/sessions/attacker-session`)).status).toBe(404);
+    });
+
+    it('rejects an import session with an invalid nested agent instead of 500ing on the raw DB call', async () => {
+      const res = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 1,
+          session: { id: 's1', name: 'sess', agent: { nested: true }, startedAt: new Date(2026, 0, 1).toISOString() },
+          segments: [],
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/agent/);
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1`)).status).toBe(404); // nothing written
+    });
+
+    it('rejects an import session with invalid metadata or endedAt types', async () => {
+      const badMetadata = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 1,
+          session: { id: 's1', name: 'sess', metadata: 'not-an-object', startedAt: new Date(2026, 0, 1).toISOString() },
+          segments: [],
+        }),
+      });
+      expect(badMetadata.status).toBe(400);
+      expect((await badMetadata.json()).error).toMatch(/metadata/);
+
+      const badEndedAt = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 1,
+          session: { id: 's2', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString(), endedAt: 12345 },
+          segments: [],
+        }),
+      });
+      expect(badEndedAt.status).toBe(400);
+      expect((await badEndedAt.json()).error).toMatch(/endedAt/);
+    });
+
+    it('also rejects an ingest session.started event with an invalid nested agent (shared validator)', async () => {
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', agent: { nested: true }, startedAt: new Date(2026, 0, 1).toISOString() } },
+          ],
+        }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(0);
+      expect(body.rejected[0].reason).toMatch(/agent/);
     });
   });
 });

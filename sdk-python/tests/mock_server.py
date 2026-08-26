@@ -9,6 +9,7 @@ import http.server
 import json
 import socketserver
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -22,7 +23,8 @@ class MockIngestServer:
         self._lock = threading.Lock()
         self.requests: List[Optional[List[Dict[str, Any]]]] = []
         self.headers: List[Dict[str, str]] = []
-        self._responses: List[Tuple[int, Dict[str, Any]]] = []
+        self._responses: List[Tuple[int, Dict[str, Any], Dict[str, str]]] = []
+        self._hang_seconds = 0.0
 
         outer = self
 
@@ -31,6 +33,13 @@ class MockIngestServer:
                 pass
 
             def do_POST(self):
+                with outer._lock:
+                    hang = outer._hang_seconds
+                if hang:
+                    # Simulate a slow/hanging endpoint: block before even
+                    # reading the body, so the client's socket read times
+                    # out rather than getting a response.
+                    time.sleep(hang)
                 length = int(self.headers.get("content-length", 0))
                 raw = self.rfile.read(length) if length else b""
                 try:
@@ -43,14 +52,16 @@ class MockIngestServer:
                     outer.requests.append(events)
                     outer.headers.append(dict(self.headers.items()))
                     if outer._responses:
-                        status, body = outer._responses.pop(0)
+                        status, body, extra_headers = outer._responses.pop(0)
                     else:
-                        status, body = 200, {"accepted": len(events) if events else 0}
+                        status, body, extra_headers = 200, {"accepted": len(events) if events else 0}, {}
 
                 data = json.dumps(body).encode("utf-8")
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(data)))
+                for name, value in extra_headers.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -62,9 +73,17 @@ class MockIngestServer:
     def endpoint(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def queue_response(self, status: int, body: Dict[str, Any]) -> None:
+    def queue_response(
+        self, status: int, body: Dict[str, Any], headers: Optional[Dict[str, str]] = None
+    ) -> None:
         with self._lock:
-            self._responses.append((status, body))
+            self._responses.append((status, body, headers or {}))
+
+    def set_hang(self, seconds: float) -> None:
+        """Make every subsequent request block for `seconds` before the
+        server responds at all, simulating a slow/hanging endpoint."""
+        with self._lock:
+            self._hang_seconds = seconds
 
     def request_count(self) -> int:
         with self._lock:

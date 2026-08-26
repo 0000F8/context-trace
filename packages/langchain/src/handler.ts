@@ -171,7 +171,26 @@ export class ContextTraceCallbackHandler {
   }
 
   handleChainEnd(_outputs: unknown, runId: string, parentRunId?: string): void {
-    if (parentRunId) return; // only the root run owns the session lifecycle
+    this.finishChainRun(runId, parentRunId);
+  }
+
+  /**
+   * LangChain calls this instead of handleChainEnd when a chain run fails.
+   * A failed root run still needs its session ended and its map entry
+   * cleaned up — otherwise a chain that always errors would leak one
+   * runToSession entry (and one open, never-ended session) per invocation.
+   */
+  handleChainError(_err: unknown, runId: string, parentRunId?: string): void {
+    this.finishChainRun(runId, parentRunId);
+  }
+
+  private finishChainRun(runId: string, parentRunId?: string): void {
+    if (parentRunId) {
+      // Nested chain run: no session lifecycle to end here (that's the root
+      // run's job) — just drop the inherited map entry so it doesn't leak.
+      this.runToSession.delete(runId);
+      return;
+    }
     const session = this.runToSession.get(runId);
     session?.end();
     this.runToSession.delete(runId);
@@ -234,8 +253,7 @@ export class ContextTraceCallbackHandler {
       responseText: extractFirstGenerationText(output),
       latencyMs: startedAt !== undefined ? Date.now() - startedAt : undefined,
     });
-    this.segments.delete(runId);
-    this.startedAt.delete(runId);
+    this.finishLlmRun(runId);
   }
 
   handleLLMError(err: unknown, runId: string, _parentRunId?: string): void {
@@ -247,8 +265,21 @@ export class ContextTraceCallbackHandler {
       error: err instanceof Error ? err.message : String(err),
       latencyMs: startedAt !== undefined ? Date.now() - startedAt : undefined,
     });
+    this.finishLlmRun(runId);
+  }
+
+  /**
+   * Drops every map entry keyed by an LLM run's own id once that run is
+   * done. `segments`/`startedAt` were always scoped to the LLM run alone,
+   * but `resolveSession` also stashes the LLM run's resolved session under
+   * its own runId in `runToSession` (see below) — without this, that entry
+   * would never be cleaned up and `runToSession` would grow by one per LLM
+   * call for the life of the process.
+   */
+  private finishLlmRun(runId: string): void {
     this.segments.delete(runId);
     this.startedAt.delete(runId);
+    this.runToSession.delete(runId);
   }
 
   /**

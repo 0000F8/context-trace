@@ -11,10 +11,16 @@ const DEAD_WEIGHT_MIN_TOKENS = 200;
 const CHURN_MIN_PRESENCE = 4;
 const CHURN_MIN_RATE = 0.5;
 
+/** A window of 0 or negative isn't a meaningful token budget — treat it as unset rather
+ * than making every non-empty segment "over window". */
+function isValidWindow(w: unknown): w is number {
+  return typeof w === 'number' && Number.isFinite(w) && w > 0;
+}
+
 function readWindow(session: CompiledTrace['session'], fallback: number | undefined): number | undefined {
   const w = session.metadata?.window;
-  if (typeof w === 'number' && Number.isFinite(w)) return w;
-  return fallback;
+  if (isValidWindow(w)) return w;
+  return isValidWindow(fallback) ? fallback : undefined;
 }
 
 /**
@@ -26,6 +32,14 @@ function readWindow(session: CompiledTrace['session'], fallback: number | undefi
 export function computeAnalytics(trace: CompiledTrace, window?: number): SessionAnalytics {
   const effectiveWindow = readWindow(trace.session, window);
   const segments = [...trace.segments].sort((a, b) => a.index - b.index);
+  // Position of each segment's index within the actually-recorded sequence — thrash and
+  // similar "was it there in the previous/next segment" logic must reason about this
+  // ordinal position, not the raw index value: segment indices can be sparse (e.g. a
+  // client that allocates an index it never records), and subtracting raw indices would
+  // manufacture a "removal" for a key that was actually present in every segment that
+  // ever existed.
+  const positionByIndex = new Map<number, number>();
+  segments.forEach((seg, position) => positionByIndex.set(seg.index, position));
 
   const perSegment: SessionAnalytics['perSegment'] = segments.map((seg) => {
     let addedTokens = 0;
@@ -87,10 +101,14 @@ export function computeAnalytics(trace: CompiledTrace, window?: number): Session
     for (let i = 1; i < sortedPresence.length; i++) {
       const prevIdx = sortedPresence[i - 1]!;
       const curIdx = sortedPresence[i]!;
-      if (curIdx - prevIdx <= 1) continue; // contiguous — no removal/re-add happened
-      const removedAt = prevIdx + 1;
+      const prevPos = positionByIndex.get(prevIdx);
+      const curPos = positionByIndex.get(curIdx);
+      if (prevPos === undefined || curPos === undefined) continue; // defensive: shouldn't happen
+      const positionGap = curPos - prevPos;
+      if (positionGap <= 1) continue; // adjacent in the actual segment sequence — no real absence
+      const gap = positionGap - 1; // count of actually-recorded segments where the key was absent
+      const removedAt = segments[prevPos + 1]!.index;
       const readdedAt = curIdx;
-      const gap = readdedAt - removedAt;
       if (gap <= THRASH_MAX_GAP) {
         thrash.push({ key: span.key, service: span.service, removedAt, readdedAt, gap });
       }

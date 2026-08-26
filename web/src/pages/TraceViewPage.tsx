@@ -129,11 +129,23 @@ export function TraceViewPage() {
     if (finding.key) setDrawerKey(finding.key);
   };
 
-  const togglePlay = () => setIsPlaying((v) => !v);
+  // Play and Live both drive selectedIndex on their own timer/event cadence —
+  // starting one stops the other so they don't fight over the selection.
+  const togglePlay = () => {
+    setIsPlaying((v) => {
+      const next = !v;
+      if (next) setIsLive(false);
+      return next;
+    });
+  };
 
   const toggleLive = () => {
     setLiveError(null);
-    setIsLive((v) => !v);
+    setIsLive((v) => {
+      const next = !v;
+      if (next) setIsPlaying(false);
+      return next;
+    });
   };
 
   // Scrubber: steps the selection forward every 700ms, pausing at the last
@@ -163,15 +175,27 @@ export function TraceViewPage() {
     if (!isLive || !sessionId) return;
     const source = new EventSource(liveUrl(sessionId));
     const onUpdate = () => {
+      // A successful event means the stream is flowing — clear any stale
+      // "reconnecting" notice from an earlier transient error.
+      setLiveError(null);
       traceState.reload();
       analyticsState.reload();
     };
     source.addEventListener('segment', onUpdate);
     source.addEventListener('outcome', onUpdate);
+    source.onopen = () => setLiveError(null);
     source.onerror = () => {
-      source.close();
-      setIsLive(false);
-      setLiveError('Live connection lost.');
+      // EventSource fires onerror during its own automatic reconnect attempts
+      // too (readyState CONNECTING) — only tear the toggle down when the
+      // browser has actually given up (readyState CLOSED); otherwise let it
+      // keep retrying and just say so.
+      if (source.readyState === EventSource.CLOSED) {
+        source.close();
+        setIsLive(false);
+        setLiveError('Live connection lost.');
+      } else {
+        setLiveError('Reconnecting…');
+      }
     };
     return () => {
       source.close();

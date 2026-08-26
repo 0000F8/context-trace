@@ -62,18 +62,23 @@ error) is attached as that segment's outcome.
 | `agent`       | `string?` | Passed through to `Session.agent` on every session this handler starts. |
 
 The handler implements: `name`, `handleChainStart`, `handleChainEnd`,
-`handleLLMStart`, `handleChatModelStart`, `handleLLMEnd`, `handleLLMError`,
-`handleToolStart`, `handleToolEnd`.
+`handleChainError`, `handleLLMStart`, `handleChatModelStart`, `handleLLMEnd`,
+`handleLLMError`, `handleToolStart`, `handleToolEnd`.
 
 ## Mapping
 
 - **Root run → session.** A `handleChainStart` with no `parentRunId` (a
   top-level `invoke`/`stream`/`batch` call) starts a session via
   `client.startSession({ id: runId, name, agent })`. Its matching
-  `handleChainEnd` calls `session.end()`.
+  `handleChainEnd` **or** `handleChainError` calls `session.end()` — LangChain
+  calls `handleChainError` instead of `handleChainEnd` when the run throws,
+  so a chain that always fails still gets its session closed out instead of
+  leaking an open session forever.
 - **Nested chain runs** (a `parentRunId` is present) don't start a new
   session — they inherit whichever session their parent run belongs to, so
   LLM calls several levels deep in a chain still land in the same session.
+  Their own `handleChainEnd`/`handleChainError` just drops that inherited
+  bookkeeping entry; only the root run's end/error closes the session itself.
 - **LLM call → segment.** Both `handleLLMStart` (plain-text prompts, used by
   completion-style LLMs) and `handleChatModelStart` (structured messages,
   used by chat models) open one segment per call, `kind: 'llm_call'`,
@@ -98,7 +103,14 @@ The handler implements: `name`, `handleChainStart`, `handleChainEnd`,
   (chat models).
 - **LLM call error → outcome.** `handleLLMError` calls `segment.record()`,
   then `segment.outcome({ error: err.message, latencyMs })` instead of a
-  normal outcome.
+  normal outcome. **`err.message` is stored verbatim** and is readable
+  through context-trace's ordinary (open) read/export path, the same as any
+  other section content — nothing here redacts it. If your model calls can
+  throw errors whose messages embed secrets (an API key echoed back in a
+  provider error, a raw request body in an SDK exception, etc.), scrub or
+  wrap that error before it reaches `handleLLMError` — e.g. by wrapping the
+  model call yourself and re-throwing a sanitized `Error`, since this
+  handler has no way to know what a given provider's error messages contain.
 - **No surrounding chain run.** A bare `model.invoke(..., { callbacks:
   [handler] })` with no chain wrapping it never sees a `handleChainStart`, so
   there's no session to inherit. In that case the LLM run falls back to
@@ -119,7 +131,5 @@ code — see `segment.section(...)` in the [SDK README](../sdk/README.md).
 
 ## Out of scope
 
-No support for streaming partial tokens (`handleLLMNewToken`), no
-`handleChainError` (a failed chain still ends its session via whatever
-`handleChainEnd`/framework cleanup your app already does), no automatic
+No support for streaming partial tokens (`handleLLMNewToken`), no automatic
 tool-call sections (see above).

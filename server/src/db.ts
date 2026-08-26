@@ -90,17 +90,21 @@ function tryCreateFts(db: Db): boolean {
 }
 
 /**
- * One-time backfill for DBs that already had sections before FTS5 support existed
- * (or before this boot's first-ever FTS table creation): if the fts table is empty
- * but sections aren't, repopulate it from the sections table.
+ * Backfill for DBs where sections_fts is behind sections — either it was empty (never
+ * populated, e.g. sections written before FTS5 support existed) or only partially
+ * populated (e.g. some sections were written during a prior boot that lacked FTS5
+ * support, so upsertSegment's own fts maintenance silently skipped them). Comparing
+ * row counts (rather than just checking for emptiness) catches both cases; healing is
+ * a full rebuild rather than trying to diff in the missing rows, since this only runs
+ * once at boot and correctness matters far more than its cost here.
  */
 function backfillFtsIfNeeded(db: Db): void {
   const ftsCount = (db.prepare('SELECT COUNT(*) AS c FROM sections_fts').get() as { c: number }).c;
-  if (ftsCount > 0) return;
   const sectionsCount = (
     db.prepare('SELECT COUNT(*) AS c FROM sections WHERE content IS NOT NULL').get() as { c: number }
   ).c;
-  if (sectionsCount === 0) return;
+  if (ftsCount >= sectionsCount) return;
+  db.exec('DELETE FROM sections_fts');
   db.exec(`
     INSERT INTO sections_fts (content, key, service, session_id, segment_id, segment_index)
     SELECT sec.content, sec.key, sec.service, seg.session_id, sec.segment_id, seg.idx

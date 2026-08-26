@@ -1,3 +1,4 @@
+import atexit
 import sys
 import threading
 import time
@@ -293,6 +294,215 @@ class TestFlushAndShutdown(ClientTestCase):
             self.assertTrue(_wait_until(lambda: len(self.server.all_events()) == 2, timeout=2.0))
         finally:
             ct.shutdown()
+
+
+class TestShutdownBounded(ClientTestCase):
+    """
+    Regression coverage for the shutdown()-blocks-far-past-its-bound defect:
+    a probe measured shutdown() taking ~24.4s against a slow endpoint
+    because the retry ladder kept sleeping through full backoff steps and
+    burning all 3 attempts even after shutdown had been requested. Fixed by
+    making the retry loop stop-event-aware and giving _send a configurable,
+    short-enough socket timeout.
+    """
+
+    PREVIOUS_MEASURED_BLOCK_SECONDS = 24.4
+
+    def test_shutdown_returns_well_under_previous_measured_block_time(self):
+        self.server.set_hang(30)  # endpoint never responds in time
+        ct = self.make_client(flush_interval=0.05, request_timeout=0.5)
+        session = ct.session("sid")
+        session.end()  # queue something so the background thread has work
+
+        # Give the background flusher a moment to start its (hanging) send.
+        time.sleep(0.1)
+
+        started = time.monotonic()
+        ct.shutdown()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, self.PREVIOUS_MEASURED_BLOCK_SECONDS / 2)
+        # With a 0.5s request timeout, a 5s join bound, and no more than one
+        # unretried attempt once stop_event is set, this should complete in
+        # a couple of seconds at most.
+        self.assertLess(elapsed, 6.0)
+
+    def test_shutdown_does_not_retry_through_full_backoff_ladder(self):
+        self.server.set_hang(30)
+        ct = self.make_client(flush_interval=0, request_timeout=0.3)
+        session = ct.session("sid")
+        session.end()
+
+        started = time.monotonic()
+        ct.shutdown()
+        elapsed = time.monotonic() - started
+
+        # One attempt at ~0.3s timeout, no backoff/retries burned once
+        # stop_event is set — nowhere near 3 * 0.3s + backoff, let alone
+        # anything close to the old ~24s.
+        self.assertLess(elapsed, 3.0)
+
+    def test_thread_reference_kept_when_still_alive_past_join_timeout(self):
+        self.server.set_hang(5)
+        ct = self.make_client(flush_interval=0.05, request_timeout=10)
+        session = ct.session("sid")
+        session.end()
+        time.sleep(0.1)  # let the background thread start its hanging send
+
+        # A short join_timeout guarantees the thread is still alive when we
+        # check — the fix must not null out `_thread` in that case.
+        ct.shutdown(join_timeout=0.05, flush_timeout=0.05)
+        self.assertIsNotNone(ct._thread)
+        self.assertTrue(any("did not stop within" in str(e) for e in self.errors))
+
+        # Clean up: let the hanging request actually finish so the daemon
+        # thread doesn't linger past this test (harmless either way since
+        # it's a daemon thread, but tidy).
+        ct._thread.join(timeout=10)
+
+
+class TestPartialRejectionParsingIsolation(ClientTestCase):
+    def test_malformed_rejected_payload_does_not_trigger_a_retry(self):
+        # 'rejected' is present but shaped in a way that would raise if
+        # naively iterated as list-of-dicts (e.g. a plain string instead of
+        # a list) — this must be reported, not mistaken for a send failure
+        # that causes a re-POST of an already-accepted batch.
+        self.server.queue_response(200, {"accepted": 1, "rejected": "not-a-list"})
+        ct = self.make_client()
+        session = ct.session("sid")
+        session.end()
+        ct.flush()
+
+        # Only one request: the malformed body must not cause a retry/re-send.
+        self.assertEqual(self.server.request_count(), 1)
+        self.assertTrue(any(self.errors), "expected the parsing failure to be reported")
+
+    def test_normal_partial_rejection_still_single_request(self):
+        self.server.queue_response(
+            200, {"accepted": 1, "rejected": [{"index": 1, "reason": "unknown segment"}]}
+        )
+        ct = self.make_client()
+        session = ct.session("sid")
+        session.end()
+        ct.flush()
+
+        self.assertEqual(self.server.request_count(), 1)
+        self.assertTrue(any("rejected 1 event" in str(e) for e in self.errors))
+
+
+class TestAtexitHook(ClientTestCase):
+    def test_atexit_hook_registered_when_enabled(self):
+        ct = self.make_client()
+        try:
+            self.assertTrue(ct._atexit_registered)
+        finally:
+            ct.shutdown()
+
+    def test_atexit_hook_not_registered_when_disabled(self):
+        ct = self.make_client(enabled=False)
+        self.assertFalse(ct._atexit_registered)
+
+    def test_shutdown_unregisters_atexit_hook(self):
+        ct = self.make_client()
+        callback = ct._atexit_flush
+        ct.shutdown()
+        # atexit.unregister is idempotent/safe even if the callback was
+        # never registered, so call it again and confirm no error — the
+        # meaningful assertion is that shutdown() already flushed and
+        # marked itself done, so a later atexit run (if any) is a no-op.
+        atexit.unregister(callback)
+        self.assertTrue(ct._shutdown_done)
+
+    def test_atexit_flush_is_idempotent_and_flushes_once(self):
+        ct = self.make_client(flush_interval=0)
+        session = ct.session("sid")
+        session.end()
+
+        ct._atexit_flush()
+        ct._atexit_flush()  # second call must be a no-op
+
+        self.assertEqual(len(self.server.all_events()), 1)
+        ct.shutdown()  # avoid leaking the background state; harmless no-op here
+
+
+class TestRedirectDoesNotLeakApiKey(ClientTestCase):
+    """
+    Regression coverage for a security defect (probe-verified): urllib's
+    default opener transparently follows redirects and forwards the
+    x-api-key header to the redirect target, even when that target is a
+    different host. A malicious or misconfigured endpoint could use a 302
+    to exfiltrate the key. Fixed by disabling redirect-following entirely
+    for ingest requests (see _NoRedirectHandler) and treating any 3xx as an
+    immediate, non-retryable failure.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.attacker = MockIngestServer()
+
+    def tearDown(self):
+        self.attacker.shutdown()
+        super().tearDown()
+
+    def test_redirect_is_not_followed_and_key_never_reaches_second_host(self):
+        redirect_target = f"{self.attacker.endpoint()}/v1/ingest"
+        self.server.queue_response(302, {}, headers={"Location": redirect_target})
+
+        ct = self.make_client(api_key="super-secret-key")
+        session = ct.session("sid")
+        session.end()
+        ct.flush()
+
+        # The primary endpoint saw exactly one request (the original POST,
+        # never a retry of it).
+        self.assertEqual(self.server.request_count(), 1)
+
+        # The critical assertion: the attacker-controlled redirect target
+        # received *nothing at all* — not the events, and certainly not
+        # the x-api-key header — because the redirect was never followed.
+        self.assertEqual(self.attacker.request_count(), 0)
+        for headers in self.attacker.headers:
+            self.assertNotIn("x-api-key", {k.lower() for k in headers})
+
+        # The 302 is surfaced as a failure rather than silently "succeeding"
+        # against an unintended host.
+        self.assertTrue(any("302" in str(e) for e in self.errors))
+
+    def test_redirect_is_treated_as_non_retryable(self):
+        # All three attempts would be 302 if it *were* retried; assert only
+        # one request actually happened, proving redirects don't get the
+        # 5xx/408/429 retry treatment.
+        for _ in range(3):
+            self.server.queue_response(
+                302, {}, headers={"Location": f"{self.attacker.endpoint()}/v1/ingest"}
+            )
+        ct = self.make_client()
+        session = ct.session("sid")
+        session.end()
+        ct.flush()
+
+        self.assertEqual(self.server.request_count(), 1)
+        self.assertEqual(self.attacker.request_count(), 0)
+
+
+class TestEndpointSchemeValidation(ClientTestCase):
+    def test_rejects_file_scheme(self):
+        with self.assertRaises(ValueError):
+            self.make_client(endpoint="file:///etc/passwd")
+
+    def test_rejects_ftp_scheme(self):
+        with self.assertRaises(ValueError):
+            self.make_client(endpoint="ftp://example.com/ingest")
+
+    def test_rejects_scheme_less_endpoint(self):
+        with self.assertRaises(ValueError):
+            self.make_client(endpoint="example.com:4720")
+
+    def test_accepts_http_and_https(self):
+        ct_http = self.make_client(endpoint=self.server.endpoint())
+        ct_http.shutdown()
+        ct_https = self.make_client(endpoint="https://example.com")
+        ct_https.shutdown()
 
 
 if __name__ == "__main__":

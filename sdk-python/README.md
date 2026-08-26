@@ -43,7 +43,7 @@ ct.shutdown()          # stop the background timer, then flush
 
 ## Options
 
-`ContextTraceClient(endpoint, api_key=None, flush_interval=2.0, max_batch=100, max_queue=5000, max_sessions=1000, on_error=None, enabled=True)`
+`ContextTraceClient(endpoint, api_key=None, flush_interval=2.0, max_batch=100, max_queue=5000, max_sessions=1000, request_timeout=10.0, on_error=None, enabled=True)`
 
 | Option            | Type                        | Default   | Description |
 |-------------------|-----------------------------|-----------|--------------|
@@ -53,8 +53,9 @@ ct.shutdown()          # stop the background timer, then flush
 | `max_batch`       | `int`                       | `100`     | Max events per `POST /v1/ingest` request. |
 | `max_queue`       | `int`                       | `5000`    | Max events buffered. On overflow, the **oldest** event is dropped and `on_error` is called. |
 | `max_sessions`    | `int`                       | `1000`    | Max distinct session ids kept in the `start_session`/`session` handle cache. On overflow, the **least-recently-used** session id is evicted. |
+| `request_timeout` | `float`                     | `10.0`    | Per-request socket timeout **in seconds** passed to `urlopen`. Bounds how long a single hung HTTP call can block — lower it if you want `shutdown()` to give up on a stuck endpoint sooner (see "Exit semantics" below). |
 | `on_error`        | `Optional[Callable[[Exception], None]]` | `None` | Called for dropped events, exhausted retries, and idempotency warnings. Exceptions raised from it are swallowed — it is never allowed to propagate back into the SDK. |
-| `enabled`         | `bool`                      | `True`    | When `False`, every capture call is a complete no-op: nothing is queued, no background thread starts, no HTTP request is ever made. |
+| `enabled`         | `bool`                      | `True`    | When `False`, every capture call is a complete no-op: nothing is queued, no background thread starts, no atexit hook is registered, no HTTP request is ever made. |
 
 An invalid numeric option (`NaN`, non-finite, or below the minimum — e.g.
 `max_batch=0`) is ignored and the default is used instead, exactly like the
@@ -95,10 +96,49 @@ TS SDK.
 - `ct.flush()` — drains the queue synchronously, sending batches of up to
   `max_batch` events. Never raises — network failures are retried and
   eventually dropped internally (see below).
-- `ct.shutdown()` — stops the background flusher thread, then flushes.
+- `ct.shutdown(join_timeout=5.0, flush_timeout=5.0)` — stops the background
+  flusher thread, then performs one bounded, best-effort final flush. See
+  "Exit semantics" below for exactly what "bounded" means and why it can't
+  be instantaneous against a stuck endpoint.
 
 Every method is synchronous — there's no `asyncio` involved anywhere in this
 client.
+
+## Exit semantics
+
+Read this before relying on delivery at process shutdown:
+
+- **Automatic safety net**: when `enabled=True`, the client registers a
+  best-effort `atexit` hook at construction time that performs one bounded
+  flush attempt if the process exits normally without you ever calling
+  `shutdown()`/`flush()`. It is **not a delivery guarantee** — `atexit`
+  hooks don't run on `os._exit()`, a `SIGKILL`, or a hard crash, and the
+  flush itself is time-boxed (see below), so a sufficiently stuck endpoint
+  can still cause queued events to be dropped at exit.
+- **Without any shutdown/atexit at all** (e.g. `os._exit()`), whatever is
+  sitting in the queue — up to `flush_interval` seconds' worth of activity,
+  or up to `max_queue` events — is lost.
+- **`shutdown()` is bounded, not instant.** It signals an internal stop
+  flag, which makes any in-progress retry ladder (in the background thread
+  or in `shutdown()`'s own final flush) abort after its *current* attempt
+  instead of sleeping through the remaining backoff steps and burning all 3
+  attempts. But a request already in flight when `shutdown()` is called
+  can't be interrupted mid-socket-read — only waited out. Worst case,
+  `shutdown()` takes roughly `join_timeout` (default 5s, waiting for the
+  background thread) plus one more request bounded by `request_timeout`
+  (default 10s). Lower `request_timeout` if you need a tighter bound and
+  can tolerate the endpoint being considered unresponsive sooner.
+- **If the background thread doesn't stop within `join_timeout`** (almost
+  always because a request is still hung past that point), `shutdown()`
+  does **not** null out its internal thread reference — it reports this via
+  `on_error` and proceeds to its own best-effort final flush anyway, rather
+  than pretending the thread already exited.
+- **"Never raises into the host app" is about capture calls**, specifically
+  `start_session`, `session`, `segment`, `section`, `record`, `outcome`,
+  `end`, plus `flush()`/`shutdown()` themselves. It is not a delivery
+  guarantee for the events those calls describe — events can still be
+  dropped on queue overflow, exhausted retries, or a process that exits
+  before a flush completes.
 
 ## Delivery semantics
 
@@ -116,6 +156,17 @@ Identical to the TypeScript SDK:
   as one summarized `Exception` via `on_error` listing each rejected event's
   type and reason. A non-JSON or unparsable response body is tolerated
   silently.
+- **Redirects are never followed.** A `3xx` response from `endpoint` is
+  treated as an immediate, non-retryable failure, not silently completed
+  against the `Location` target. urllib's default opener would otherwise
+  transparently follow redirects *and forward the `x-api-key` header to
+  wherever they point*, even a different host — a trace sink has no
+  legitimate reason to redirect, so this SDK refuses rather than risk
+  leaking the key to an unintended (or malicious) endpoint.
+- **`endpoint` must be `http://` or `https://`.** Validated once at
+  construction time (raises `ValueError` immediately, unlike the
+  never-raises guarantee for capture calls) — `file://`, `ftp://`, and
+  scheme-less values are rejected before any request is ever attempted.
 - **Backpressure**: the queue is bounded by `max_queue`. On overflow the
   oldest queued event is dropped (not the newest) and `on_error` fires.
 - **Never raises**: capture calls, `flush()`, and `shutdown()` never raise
