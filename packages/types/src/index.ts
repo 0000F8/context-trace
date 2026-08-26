@@ -60,10 +60,21 @@ export interface Section {
 
 export type SegmentWithSections = Segment & { sections: Section[] };
 
+/** Model-call result attached to a segment after the fact (v0.2). */
+export interface SegmentOutcome {
+  responseText?: string;
+  latencyMs?: number;
+  /** Responding model, when it differs from the segment's requested model. */
+  model?: string;
+  scores?: Record<string, number>;
+  error?: string;
+}
+
 export type IngestEvent =
   | { type: 'session.started'; data: Session }
   | { type: 'segment.recorded'; data: SegmentWithSections }
-  | { type: 'session.ended'; data: { sessionId: string; endedAt: string } };
+  | { type: 'session.ended'; data: { sessionId: string; endedAt: string } }
+  | { type: 'segment.outcome'; data: { sessionId: string; segmentId: string; outcome: SegmentOutcome } };
 
 export interface IngestRequest {
   events: IngestEvent[];
@@ -107,6 +118,7 @@ export interface SegmentSummary {
   totalTokens: number;
   sectionCount: number;
   delta: DeltaCounts;
+  outcome?: SegmentOutcome;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -141,6 +153,7 @@ export interface TraceSegment {
   services: TraceSegmentService[];
   /** Ordered by section position; removals appended last. */
   ops: TraceOp[];
+  outcome?: SegmentOutcome;
 }
 
 export interface TraceSpan {
@@ -192,6 +205,71 @@ export interface Stats {
   sections: number;
   totalTokens: number;
   lastIngestAt: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Analytics (v0.2) — computed from the compiled trace, pure
+// ---------------------------------------------------------------------------
+
+export type FindingKind = 'thrash' | 'dead-weight' | 'churn' | 'over-window';
+
+export interface Finding {
+  severity: 'notice' | 'warning';
+  kind: FindingKind;
+  message: string;
+  key?: string;
+  segmentIndex?: number;
+}
+
+export interface SegmentAnalytics {
+  index: number;
+  totalTokens: number;
+  addedTokens: number;
+  changedTokens: number;
+  carriedTokens: number;
+  removedTokens: number;
+  /** carriedTokens / totalTokens; 0 for the first segment or empty segments. */
+  carryRatio: number;
+  overWindow: boolean;
+  latencyMs?: number;
+}
+
+export interface SessionAnalytics {
+  /** Context window from session.metadata.window, when numeric. */
+  window?: number;
+  /** Session-level: Σ carried / Σ total across non-first segments. */
+  carryRatio: number;
+  perSegment: SegmentAnalytics[];
+  churn: Array<{ key: string; service: string; presence: number; changes: number; churnRate: number }>;
+  deadWeight: Array<{ key: string; service: string; carriedSegments: number; tokens: number }>;
+  thrash: Array<{ key: string; service: string; removedAt: number; readdedAt: number; gap: number }>;
+  /** Warnings first, then notices. */
+  findings: Finding[];
+  outcomes?: { avgLatencyMs?: number; scoreAverages?: Record<string, number> };
+}
+
+// ---------------------------------------------------------------------------
+// Search + export (v0.2)
+// ---------------------------------------------------------------------------
+
+export interface SearchHit {
+  sessionId: string;
+  sessionName: string;
+  segmentIndex: number;
+  key: string;
+  service: string;
+  snippet: string;
+}
+
+export interface SearchResponse {
+  hits: SearchHit[];
+}
+
+export interface SessionExport {
+  version: 1;
+  exportedAt: string;
+  session: Session;
+  segments: Array<SegmentWithSections & { outcome?: SegmentOutcome }>;
 }
 
 // ---------------------------------------------------------------------------

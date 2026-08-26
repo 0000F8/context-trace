@@ -1,4 +1,12 @@
-import type { CompiledTrace, SegmentDetail, SessionDetail, SessionSummary, Stats } from '@context-trace/types';
+import type {
+  CompiledTrace,
+  SearchResponse,
+  SegmentDetail,
+  SessionAnalytics,
+  SessionDetail,
+  SessionSummary,
+  Stats,
+} from '@context-trace/types';
 
 const BASE = '/api/v1';
 
@@ -62,6 +70,24 @@ export function getTrace(id: string): Promise<CompiledTrace> {
 
 export function getSegmentDetail(id: string, index: number): Promise<SegmentDetail> {
   return request(`/sessions/${encodeURIComponent(id)}/segments/${index}`);
+}
+
+export function getAnalytics(id: string): Promise<SessionAnalytics> {
+  return request<SessionAnalytics>(`/sessions/${encodeURIComponent(id)}/trace/analytics`);
+}
+
+export function searchContent(q: string, limit = 20): Promise<SearchResponse> {
+  return request<SearchResponse>(`/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+}
+
+/** Path (through the proxy) for a session-export download link. */
+export function exportUrl(id: string): string {
+  return `${BASE}/sessions/${encodeURIComponent(id)}/export`;
+}
+
+/** SSE URL for the live tail of a session (consume with EventSource). */
+export function liveUrl(id: string): string {
+  return `${BASE}/sessions/${encodeURIComponent(id)}/live`;
 }
 
 export async function deleteSession(id: string): Promise<void> {
