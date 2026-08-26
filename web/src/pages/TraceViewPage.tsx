@@ -96,7 +96,8 @@ export function TraceViewPage() {
   const groups = useMemo(() => (trace ? groupSpansByService(trace.spans, serviceOrder) : []), [trace, serviceOrder]);
 
   const rawWindow = trace?.session.metadata?.window;
-  const budgetWindow = typeof rawWindow === 'number' ? rawWindow : undefined;
+  // Mirror the server's readWindow: 0/negative means unset (no budget line).
+  const budgetWindow = typeof rawWindow === 'number' && rawWindow > 0 ? rawWindow : undefined;
   const overWindowIndexes = useMemo(
     () => new Set((analytics?.perSegment ?? []).filter((p) => p.overWindow).map((p) => p.index)),
     [analytics],
@@ -132,20 +133,16 @@ export function TraceViewPage() {
   // Play and Live both drive selectedIndex on their own timer/event cadence —
   // starting one stops the other so they don't fight over the selection.
   const togglePlay = () => {
-    setIsPlaying((v) => {
-      const next = !v;
-      if (next) setIsLive(false);
-      return next;
-    });
+    const next = !isPlaying;
+    setIsPlaying(next);
+    if (next) setIsLive(false);
   };
 
   const toggleLive = () => {
     setLiveError(null);
-    setIsLive((v) => {
-      const next = !v;
-      if (next) setIsPlaying(false);
-      return next;
-    });
+    const next = !isLive;
+    setIsLive(next);
+    if (next) setIsPlaying(false);
   };
 
   // Scrubber: steps the selection forward every 700ms, pausing at the last

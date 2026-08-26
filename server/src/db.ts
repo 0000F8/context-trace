@@ -103,7 +103,11 @@ function backfillFtsIfNeeded(db: Db): void {
   const sectionsCount = (
     db.prepare('SELECT COUNT(*) AS c FROM sections WHERE content IS NOT NULL').get() as { c: number }
   ).c;
-  if (ftsCount >= sectionsCount) return;
+  // Rebuild on ANY count divergence (either direction). Known limitation:
+  // content drift with identical counts (an FTS5-less boot that updated a
+  // section in place) is not detected; a full rebuild only happens when the
+  // counts disagree.
+  if (ftsCount === sectionsCount) return;
   db.exec('DELETE FROM sections_fts');
   db.exec(`
     INSERT INTO sections_fts (content, key, service, session_id, segment_id, segment_index)

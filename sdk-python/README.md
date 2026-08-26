@@ -123,11 +123,14 @@ Read this before relying on delivery at process shutdown:
   or in `shutdown()`'s own final flush) abort after its *current* attempt
   instead of sleeping through the remaining backoff steps and burning all 3
   attempts. But a request already in flight when `shutdown()` is called
-  can't be interrupted mid-socket-read — only waited out. Worst case,
-  `shutdown()` takes roughly `join_timeout` (default 5s, waiting for the
-  background thread) plus one more request bounded by `request_timeout`
-  (default 10s). Lower `request_timeout` if you need a tighter bound and
-  can tolerate the endpoint being considered unresponsive sooner.
+  can't be interrupted mid-socket-read — only waited out. The bound is
+  therefore roughly `join_timeout` (default 5s, waiting for the background
+  thread) plus **one request per queued batch** in the final flush — a
+  backed-up queue against a slow endpoint drains one bounded request at a
+  time, so worst case scales with `ceil(queued events / max_batch) ×
+  request_timeout`, not a flat "one more request". Lower `request_timeout`
+  (default 10s), call `flush()` periodically to keep the queue shallow, or
+  accept the loss and skip `shutdown()` if you need a hard exit bound.
 - **If the background thread doesn't stop within `join_timeout`** (almost
   always because a request is still hung past that point), `shutdown()`
   does **not** null out its internal thread reference — it reports this via
