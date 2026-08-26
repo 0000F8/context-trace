@@ -49,6 +49,29 @@
   opacity: 0.5;
 }
 
+.timeline__budget-line {
+  stroke: var(--service-4);
+  stroke-width: 1;
+  stroke-dasharray: 4, 3;
+  opacity: 0.75;
+}
+
+.timeline__axis-sticky-label--budget {
+  color: var(--service-4);
+}
+
+.timeline__index-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  fill: var(--ink-2);
+  pointer-events: none;
+}
+
+.timeline__index-label.is-over-window {
+  fill: var(--service-4);
+  font-weight: 600;
+}
+
 .timeline__tick-label {
   text-anchor: end;
 }

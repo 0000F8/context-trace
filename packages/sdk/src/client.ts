@@ -12,6 +12,7 @@ import type {
   Section,
   SectionRole,
   SegmentKind,
+  SegmentOutcome,
   SegmentWithSections,
   ServiceKind,
   Session,
@@ -104,12 +105,25 @@ export interface SegmentBuilder {
    * is a no-op that reports a warning via onError instead of throwing.
    */
   record(): void;
+  /**
+   * Attach a model-call result (latency, response text, scores, error) to
+   * this segment. Valid only after `record()` — calling before it reports a
+   * warning via onError and does not emit anything, since the server has no
+   * segment id to correlate against yet.
+   */
+  outcome(outcome: SegmentOutcome): void;
 }
 
 export interface SessionHandle {
   readonly id: string;
   /** Start building a new segment (context snapshot) in this session. */
   segment(options?: SegmentOptions): SegmentBuilder;
+  /**
+   * Attach a model-call result to a segment by id, for stateless hook
+   * contexts that only have a session id + segment id to correlate against
+   * (rather than holding the originating `SegmentBuilder` in memory).
+   */
+  outcome(segmentId: string, outcome: SegmentOutcome): void;
   /** Mark the session ended. */
   end(endedAt?: string): void;
 }
@@ -475,6 +489,13 @@ class SessionHandleImpl implements SessionHandle {
     );
   }
 
+  outcome(segmentId: string, outcome: SegmentOutcome): void {
+    this.client.enqueue({
+      type: 'segment.outcome',
+      data: { sessionId: this.id, segmentId, outcome },
+    });
+  }
+
   end(endedAt?: string): void {
     this.client.enqueue({
       type: 'session.ended',
@@ -552,6 +573,23 @@ class SegmentBuilderImpl implements SegmentBuilder {
         sections,
       };
       this.client.enqueue({ type: 'segment.recorded', data: segment });
+    } catch (err) {
+      this.client.reportError(err);
+    }
+  }
+
+  outcome(outcome: SegmentOutcome): void {
+    try {
+      if (!this.recorded) {
+        this.client.reportError(
+          new Error(`context-trace: outcome() called before record() on segment ${this.id}`),
+        );
+        return;
+      }
+      this.client.enqueue({
+        type: 'segment.outcome',
+        data: { sessionId: this.sessionId, segmentId: this.id, outcome },
+      });
     } catch (err) {
       this.client.reportError(err);
     }

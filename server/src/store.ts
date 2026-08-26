@@ -6,16 +6,20 @@ import type {
   SectionState,
   Segment,
   SegmentKind,
+  SegmentOutcome,
   SegmentSummary,
   SegmentWithSections,
   SegmentDetail,
+  SearchHit,
   ServiceKind,
   Session,
   SessionDetail,
+  SessionExport,
   SessionSummary,
   Stats,
 } from '@context-trace/types';
 import type { Db } from './db.js';
+import { hasFtsSupport } from './db.js';
 import { compileTrace, deltaCounts, diffSections } from './trace/compile.js';
 import type { TraceSourceSegment } from './trace/compile.js';
 
@@ -37,6 +41,7 @@ interface SegmentRow {
   model: string | null;
   timestamp: string;
   metadata: string | null;
+  outcome: string | null;
 }
 
 interface SectionRow {
@@ -84,6 +89,10 @@ function segmentRowToSegment(row: SegmentRow): Segment {
     timestamp: row.timestamp,
     metadata: row.metadata ? (JSON.parse(row.metadata) as Record<string, unknown>) : undefined,
   };
+}
+
+function parseOutcome(raw: string | null): SegmentOutcome | undefined {
+  return raw ? (JSON.parse(raw) as SegmentOutcome) : undefined;
 }
 
 function sectionRowToSection(row: SectionRow): Section {
@@ -158,11 +167,20 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
        timestamp = excluded.timestamp,
        metadata = excluded.metadata`
   );
+  // Note: outcome is deliberately never touched here — it's a separate event
+  // (segment.outcome) applied later via applySegmentOutcome, and a re-recorded/updated
+  // segment must not silently wipe out an outcome already attached to it.
   const deleteSectionsStmt = db.prepare('DELETE FROM sections WHERE segment_id = ?');
   const insertSectionStmt = db.prepare(
     `INSERT INTO sections (segment_id, key, service, service_kind, role, position, content, content_hash, tokens, metadata)
      VALUES (@segment_id, @key, @service, @service_kind, @role, @position, @content, @content_hash, @tokens, @metadata)`
   );
+  const deleteFtsStmt = db.prepare('DELETE FROM sections_fts WHERE segment_id = ?');
+  const insertFtsStmt = db.prepare(
+    `INSERT INTO sections_fts (content, key, service, session_id, segment_id, segment_index)
+     VALUES (@content, @key, @service, @session_id, @segment_id, @segment_index)`
+  );
+  const fts = hasFtsSupport(db);
 
   const tx = db.transaction((seg: SegmentWithSections) => {
     // Inside the transaction: if anything below throws (e.g. a constraint violation),
@@ -180,6 +198,7 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
       metadata: seg.metadata ? JSON.stringify(seg.metadata) : null,
     });
     deleteSectionsStmt.run(seg.id);
+    if (fts) deleteFtsStmt.run(seg.id);
     for (const section of seg.sections) {
       const content = section.content ?? null;
       const tokens =
@@ -207,9 +226,39 @@ export function upsertSegment(db: Db, segment: SegmentWithSections): void {
         tokens,
         metadata: section.metadata ? JSON.stringify(section.metadata) : null,
       });
+      if (fts && content !== null) {
+        insertFtsStmt.run({
+          content,
+          key: section.key,
+          service: section.service,
+          session_id: seg.sessionId,
+          segment_id: seg.id,
+          segment_index: seg.index,
+        });
+      }
     }
   });
   tx(segment);
+}
+
+/**
+ * Applies a `segment.outcome` event. Returns false when the segment doesn't exist
+ * under that session — the caller (app.ts) turns that into a per-event rejection
+ * rather than silently no-op-ing or fabricating a segment.
+ */
+export function applySegmentOutcome(db: Db, sessionId: string, segmentId: string, outcome: SegmentOutcome): boolean {
+  const result = db
+    .prepare('UPDATE segments SET outcome = ? WHERE id = ? AND session_id = ?')
+    .run(JSON.stringify(outcome), segmentId, sessionId);
+  return result.changes > 0;
+}
+
+/** Looks up a segment's index by id, scoped to a session — used to shape live `outcome` events. */
+export function getSegmentIndexById(db: Db, sessionId: string, segmentId: string): number | undefined {
+  const row = db.prepare('SELECT idx FROM segments WHERE id = ? AND session_id = ?').get(segmentId, sessionId) as
+    | { idx: number }
+    | undefined;
+  return row?.idx;
 }
 
 /**
@@ -223,7 +272,17 @@ export function endSession(db: Db, sessionId: string, endedAt: string): boolean 
 }
 
 export function deleteSession(db: Db, id: string): boolean {
-  const result = db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+  // sections_fts is a virtual table: the sessions/segments/sections FK cascade
+  // (ON DELETE CASCADE) never reaches it, so it needs its own explicit cleanup.
+  const tx = db.transaction((sessionId: string) => {
+    if (hasFtsSupport(db)) {
+      db.prepare(
+        `DELETE FROM sections_fts WHERE segment_id IN (SELECT id FROM segments WHERE session_id = ?)`
+      ).run(sessionId);
+    }
+    return db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
+  });
+  const result = tx(id);
   return result.changes > 0;
 }
 
@@ -246,6 +305,7 @@ function loadSegmentsWithSectionMeta(db: Db, sessionId: string): TraceSourceSegm
   return segRows.map((row) => ({
     ...segmentRowToSegment(row),
     sections: (sectionStmt.all(row.id) as SectionMetaRow[]).map(sectionMetaRowToSection),
+    outcome: parseOutcome(row.outcome),
   }));
 }
 
@@ -254,7 +314,7 @@ function loadSingleSegmentWithSections(db: Db, row: SegmentRow): TraceSourceSegm
   const sectionRows = db
     .prepare('SELECT * FROM sections WHERE segment_id = ? ORDER BY position ASC')
     .all(row.id) as SectionRow[];
-  return { ...segmentRowToSegment(row), sections: sectionRows.map(sectionRowToSection) };
+  return { ...segmentRowToSegment(row), sections: sectionRows.map(sectionRowToSection), outcome: parseOutcome(row.outcome) };
 }
 
 /**
@@ -415,6 +475,7 @@ export function getSessionDetail(db: Db, id: string): SessionDetail | undefined 
       totalTokens: seg.sections.reduce((sum, s) => sum + s.tokens, 0),
       sectionCount: seg.sections.length,
       delta: deltaCounts(diff),
+      outcome: seg.outcome,
     });
     previous = seg;
   }
@@ -483,8 +544,86 @@ export function getSegmentDetail(db: Db, sessionId: string, index: number): Segm
       totalTokens: seg.sections.reduce((sum, s) => sum + s.tokens, 0),
       sectionCount: seg.sections.length,
       delta: deltaCounts(diff),
+      outcome: seg.outcome,
     },
     sections,
     removed: diff.removed,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Search (FTS5)
+// ---------------------------------------------------------------------------
+
+export interface SearchOptions {
+  q: string;
+  limit: number;
+}
+
+/**
+ * Full-text search over section content. `q` is passed as a bound parameter but still
+ * wrapped as a quoted FTS5 phrase (embedded `"` doubled) so that FTS query-syntax
+ * characters in user input (`OR`, unbalanced quotes, `-`, `*`, ...) can't produce a
+ * syntax error or silently widen the query — the whole string is always matched as a
+ * literal phrase, never parsed as an FTS5 expression.
+ */
+export function searchSections(db: Db, opts: SearchOptions): SearchHit[] {
+  const phrase = `"${opts.q.replace(/"/g, '""')}"`;
+  const rows = db
+    .prepare(
+      `SELECT f.session_id AS session_id, s.name AS session_name, f.segment_index AS segment_index,
+              f.key AS key, f.service AS service,
+              snippet(sections_fts, 0, '[', ']', '…', 12) AS snippet
+       FROM sections_fts f
+       JOIN sessions s ON s.id = f.session_id
+       WHERE sections_fts MATCH ?
+       ORDER BY rank
+       LIMIT ?`
+    )
+    .all(phrase, opts.limit) as Array<{
+    session_id: string;
+    session_name: string;
+    segment_index: number;
+    key: string;
+    service: string;
+    snippet: string;
+  }>;
+
+  return rows.map((r) => ({
+    sessionId: r.session_id,
+    sessionName: r.session_name,
+    segmentIndex: r.segment_index,
+    key: r.key,
+    service: r.service,
+    snippet: r.snippet,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+export function exportSession(db: Db, id: string): SessionExport | undefined {
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
+  if (!row) return undefined;
+
+  const session = sessionRowToSession(row);
+  const segRows = db.prepare('SELECT * FROM segments WHERE session_id = ? ORDER BY idx ASC').all(id) as SegmentRow[];
+  const segments = segRows.map((segRow) => {
+    const seg = loadSingleSegmentWithSections(db, segRow);
+    return {
+      id: seg.id,
+      sessionId: seg.sessionId,
+      index: seg.index,
+      label: seg.label,
+      kind: seg.kind,
+      model: seg.model,
+      timestamp: seg.timestamp,
+      metadata: seg.metadata,
+      sections: seg.sections,
+      outcome: seg.outcome,
+    };
+  });
+
+  return { version: 1, exportedAt: new Date().toISOString(), session, segments };
 }

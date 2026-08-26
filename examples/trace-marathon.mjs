@@ -151,6 +151,22 @@ for (let turn = 0; turn < TURNS; turn++) {
     seg.section({ key, service, serviceKind, content: v.content, tokens: v.tokens });
   }
   seg.record();
+  // Outcome linkage: latency grows with context size; the over-window call
+  // degrades hard and the truncation turn recovers.
+  const tokens = total() + histTokens;
+  if (typeof seg.outcome === 'function') {
+    if (isOverflow) {
+      seg.outcome({ latencyMs: 30_000, error: 'model call timed out: context exceeds window', scores: { helpfulness: 0.05 } });
+    } else {
+      const latencyMs = Math.round(600 + tokens * 0.012 + rand() * 400);
+      const helpfulness = Math.max(0.2, Math.min(0.97, 0.95 - tokens / 400_000 - rand() * 0.08));
+      seg.outcome({
+        latencyMs,
+        scores: { helpfulness: Math.round(helpfulness * 100) / 100 },
+        responseText: `Turn ${turn}: acknowledged. ${label}. Next probe queued.`,
+      });
+    }
+  }
   summaryRows.push({ turn, label, tokens: total(), over: total() > WINDOW });
 }
 

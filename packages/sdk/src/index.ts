@@ -37,6 +37,7 @@ export type {
   SectionRole,
   Segment,
   SegmentKind,
+  SegmentOutcome,
   SegmentWithSections,
   ServiceKind,
   Session,

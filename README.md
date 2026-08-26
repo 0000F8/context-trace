@@ -59,6 +59,16 @@ await ct.shutdown();
 
 See `packages/sdk/README.md` for the framework-hook adapter pattern and full options.
 
+## v0.2 highlights
+
+- **Live tail** — toggle "Live" on a trace to follow a running session over SSE (`/v1/sessions/:id/live`); the newest segment slides in as your agent works.
+- **Budget line + findings** — sessions with `metadata.window` get a dashed window line on the timeline; `/v1/sessions/:id/trace/analytics` computes carry ratio, churn, dead weight, and **eviction thrash** (evicted then re-added within 5 segments — your compaction policy arguing with itself), surfaced as findings in the left rail.
+- **Outcomes** — attach `{ latencyMs, scores, responseText, error }` to segments (`seg.outcome(...)` / `session.outcome(id, ...)`); shown in the inspector, aggregated in analytics.
+- **Compare** — check two sessions in the list → `/compare`: metric deltas, per-service share shifts, aligned strata summary.
+- **Copy as prompt** — reconstruct any segment as markdown or a messages array from the inspector.
+- **Search, deep links, scrubber, export** — full-text search over section content (FTS5), shareable `?segment=N&section=key` links, a playback scrubber, and session export/import (`GET .../export`, `POST /v1/import`).
+- **Adapters** — `@context-trace/langchain` (callback handler), `adapters/claude-code` (hook-driven capture of real Claude Code sessions), and a zero-dependency **Python SDK** (`sdk-python/`, `pip install -e sdk-python`).
+
 ## Future work
 
-Python SDK, multi-tenant auth, live streaming, retention policies, OTLP interop.
+Multi-tenant auth, retention policies, OTLP interop, cross-session outcome correlation.

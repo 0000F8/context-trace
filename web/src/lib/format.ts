@@ -26,3 +26,21 @@ export function previewLine(content: string, max = 96): string {
   const line = lines.find((l) => l.trim().length > 0) ?? lines[0] ?? '';
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
+
+/** Compact token count for axis labels: 8192 -> '8.2k', 180000 -> '180k', 400 -> '400'. */
+export function formatCompactTokens(n: number): string {
+  if (n < 1000) return String(Math.round(n));
+  const k = n / 1000;
+  const rounded = k >= 10 ? Math.round(k) : Math.round(k * 10) / 10;
+  return `${rounded}k`;
+}
+
+/** Formats a 0..1 ratio as a whole-number percentage, e.g. 0.624 -> '62%'. */
+export function formatPercent(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+/** Formats milliseconds as seconds with one decimal, e.g. 1400 -> '1.4s'. */
+export function formatLatency(ms: number): string {
+  return `${(ms / 1000).toFixed(1)}s`;
+}

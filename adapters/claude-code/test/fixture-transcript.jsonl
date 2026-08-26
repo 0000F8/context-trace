@@ -1,0 +1,4 @@
+{"type":"user","uuid":"u1","timestamp":"2026-08-25T10:00:00.000Z","message":{"role":"user","content":"What's the weather in Paris right now?"}}
+{"type":"assistant","uuid":"a1","timestamp":"2026-08-25T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Let me check that for you."},{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Paris"}}]}}
+{"type":"user","uuid":"u2","timestamp":"2026-08-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":[{"type":"text","text":"Sunny, 22C"}]}]}}
+{"type":"assistant","uuid":"a2","timestamp":"2026-08-25T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"It's sunny and 22°C in Paris right now."}]}}

@@ -395,6 +395,76 @@ describe('session handle cache (bounded by maxSessions, LRU eviction)', () => {
   });
 });
 
+describe('segment outcome', () => {
+  it('emits segment.outcome after record(), with the right shape', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+    seg.outcome({ latencyMs: 842, responseText: 'hi there', model: 'claude-sonnet-5' });
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    const outcomeEvent = events.find((e) => e.type === 'segment.outcome');
+    expect(outcomeEvent?.type).toBe('segment.outcome');
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data.sessionId).toBe(session.id);
+    expect(outcomeEvent.data.segmentId).toBe(seg.id);
+    expect(outcomeEvent.data.outcome).toEqual({
+      latencyMs: 842,
+      responseText: 'hi there',
+      model: 'claude-sonnet-5',
+    });
+  });
+
+  it('warns via onError and does not emit when called before record()', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const onError = vi.fn();
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0, onError });
+    const session = ct.startSession({ name: 's' });
+    const seg = session.segment({ kind: 'llm_call' });
+    seg.outcome({ latencyMs: 100 });
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+
+    seg.section({ key: 'a', service: 'svc', serviceKind: 'other', content: 'x' });
+    seg.record();
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    expect(events.find((e) => e.type === 'segment.outcome')).toBeUndefined();
+  });
+
+  it('session.outcome(segmentId, o) emits for stateless correlation', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ct = createClient({ endpoint: 'http://localhost:4720', flushIntervalMs: 0 });
+    ct.session('existing-session-id').outcome('some-segment-id', { error: 'timeout' });
+
+    await ct.flush();
+
+    const events = eventsFromCall(fetchMock.mock.calls[0] as unknown as [string, RequestInit?]);
+    expect(events).toHaveLength(1);
+    const outcomeEvent = events[0];
+    expect(outcomeEvent?.type).toBe('segment.outcome');
+    if (outcomeEvent?.type !== 'segment.outcome') throw new Error('unreachable');
+    expect(outcomeEvent.data).toEqual({
+      sessionId: 'existing-session-id',
+      segmentId: 'some-segment-id',
+      outcome: { error: 'timeout' },
+    });
+  });
+});
+
 describe('option validation', () => {
   it('falls back to the default maxBatch instead of looping forever on maxBatch: 0', async () => {
     const fetchMock = vi.fn().mockResolvedValue(makeOkResponse());

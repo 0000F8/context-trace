@@ -1,6 +1,8 @@
+import { useEffect, useRef, useState } from 'react';
 import type { AnnotatedSection, SegmentDetail, Section, TraceSegment } from '@context-trace/types';
 import { diffLines } from '../lib/diff';
-import { formatTokens, previewLine } from '../lib/format';
+import { formatLatency, formatTokens, previewLine } from '../lib/format';
+import { buildPromptMarkdown, buildPromptMessages } from '../lib/prompt';
 import { ServiceChip } from './ServiceChip';
 import { LoadingState } from './LoadingState';
 import { ErrorState } from './ErrorState';
@@ -21,6 +23,21 @@ interface InspectorProps {
 }
 
 export function Inspector({ segment, previousSegment, detail, loading, error, colorMap, tab, onTabChange, onOpenSection }: InspectorProps) {
+  const [copiedLabel, setCopiedLabel] = useState<string | null>(null);
+  const [showResponse, setShowResponse] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    setShowResponse(false);
+  }, [segment?.id]);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current != null) window.clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
   if (!segment) {
     return (
       <aside className="inspector">
@@ -30,6 +47,33 @@ export function Inspector({ segment, previousSegment, detail, loading, error, co
   }
 
   const delta = previousSegment ? segment.totalTokens - previousSegment.totalTokens : null;
+  const outcome = segment.outcome;
+
+  function flashCopied(label: string) {
+    setCopiedLabel(label);
+    if (copiedTimer.current != null) window.clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => setCopiedLabel(null), 1500);
+  }
+
+  async function copyMarkdown() {
+    if (!detail) return;
+    try {
+      await navigator.clipboard.writeText(buildPromptMarkdown(detail));
+      flashCopied('Copied markdown');
+    } catch {
+      // clipboard unavailable — nothing more we can do here.
+    }
+  }
+
+  async function copyMessages() {
+    if (!detail) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(buildPromptMessages(detail), null, 2));
+      flashCopied('Copied messages');
+    } catch {
+      // clipboard unavailable — nothing more we can do here.
+    }
+  }
 
   return (
     <aside className="inspector">
@@ -47,6 +91,31 @@ export function Inspector({ segment, previousSegment, detail, loading, error, co
             </span>
           )}
         </div>
+        {outcome && (
+          <div className="inspector__outcome">
+            {outcome.latencyMs != null && <span className="inspector__chip inspector__chip--mono">{formatLatency(outcome.latencyMs)}</span>}
+            {outcome.scores &&
+              Object.entries(outcome.scores).map(([key, value]) => (
+                <span key={key} className="inspector__chip">
+                  {key} {value.toFixed(2)}
+                </span>
+              ))}
+            {outcome.error && <span className="inspector__chip inspector__chip--error">{outcome.error}</span>}
+          </div>
+        )}
+        <div className="inspector__actions">
+          <button type="button" disabled={loading || !detail} onClick={copyMarkdown}>
+            Copy markdown
+          </button>
+          <button type="button" disabled={loading || !detail} onClick={copyMessages}>
+            Copy messages
+          </button>
+          {copiedLabel && (
+            <span className="inspector__copied" role="status">
+              {copiedLabel}
+            </span>
+          )}
+        </div>
       </header>
       <div className="inspector__tabs" role="tablist">
         <button role="tab" aria-selected={tab === 'changes'} className={tab === 'changes' ? 'is-active' : ''} onClick={() => onTabChange('changes')}>
@@ -56,6 +125,14 @@ export function Inspector({ segment, previousSegment, detail, loading, error, co
           Sections
         </button>
       </div>
+      {outcome?.responseText && (
+        <div className="inspector__response">
+          <button type="button" className="inspector__response-toggle" onClick={() => setShowResponse((v) => !v)}>
+            {showResponse ? 'Hide response' : 'Show response'}
+          </button>
+          {showResponse && <pre className="inspector__response-content">{outcome.responseText}</pre>}
+        </div>
+      )}
       <div className="inspector__body">
         {loading && <LoadingState label="Loading segment" />}
         {error && <ErrorState message={error} />}

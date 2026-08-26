@@ -26,7 +26,9 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
   const [tooltip, setTooltip] = useState<{ x: number; y: number; label: string } | null>(null);
   const rows = groups.flatMap((g) => g.rows.map((row) => ({ span: row.span, service: g.service })));
   const width = gutterWidth + segments.length * COLUMN_WIDTH;
-  const height = rows.length * ROW_HEIGHT + 24;
+  // No bottom index axis of its own: the sticky composition timeline above
+  // carries the always-visible segment-index row for both charts.
+  const height = rows.length * ROW_HEIGHT + 4;
   const showLabelText = gutterWidth >= 60;
   // Char budget for middle-truncation at the current gutter width (mono ~7.2px/char).
   const labelChars = Math.max(6, Math.floor((gutterWidth - 30) / 7.2));
@@ -135,17 +137,6 @@ export function StrataGrid({ groups, segments, cellStates, colorMap, hoveredServ
             </g>
           );
         })}
-        {segments.map((seg, c) => (
-          <text
-            key={seg.id}
-            x={gutterWidth + c * COLUMN_WIDTH + COLUMN_WIDTH / 2}
-            y={rows.length * ROW_HEIGHT + 16}
-            className="strata-grid__axis-label"
-            textAnchor="middle"
-          >
-            {seg.index}
-          </text>
-        ))}
       </svg>
       {tooltip && (
         <div className="strata-grid__tooltip" style={{ left: tooltip.x, top: tooltip.y }}>

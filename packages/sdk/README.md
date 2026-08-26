@@ -65,7 +65,9 @@ await ct.flush();      // drain queue (also on timer); ct.shutdown() = flush + s
   - `input: { key, service, serviceKind, role?, content?, tokens?, metadata? }` — `contentHash` is computed from `content ?? ''` immediately. `tokens` defaults to `estimateTokens(content ?? '')` when omitted.
   - Section `position` is **not** set here — it's assigned at `record()` time from call order (arrival order), so it's stable even under interleaved async calls.
 - `segment.record()` — finalizes the segment (assigns positions, computes the snapshot) and enqueues `segment.recorded`. **Idempotent**: a second call on the same builder is a no-op that reports a warning via `onError` instead of throwing. If two `section()` calls used the same `key`, the last one wins (its content replaces the earlier one in the same ordinal slot) and a warning is reported via `onError` — the server rejects a segment snapshot outright if it contains a duplicate key, so the SDK resolves it client-side first.
+- `segment.outcome(o)` — attaches a model-call result (`{ responseText?, latencyMs?, model?, scores?, error? }`) to this segment and enqueues `segment.outcome`. Valid **only after** `record()`: the server correlates by segment id, which doesn't exist until the segment snapshot has been enqueued. Calling it before `record()` reports a warning via `onError` and enqueues nothing — it does not queue and retry later.
 - `session.end(endedAt?)` — enqueues `session.ended`.
+- `session.outcome(segmentId, o)` — attaches a model-call result to a segment **by id**, for stateless hook contexts that only have a session id and segment id to correlate against (e.g. an `handleLLMEnd`-style callback that didn't keep the originating `SegmentBuilder` in memory, or a hook that runs in a separate process/invocation from the one that recorded the segment). Enqueues the same `segment.outcome` event as `segment.outcome(o)` above — there is no ordering requirement against the matching `segment.recorded` beyond what the server enforces (rejected with `'unknown segment'` if the segment id doesn't exist yet when the event is applied).
 - `ct.flush()` — `Promise<void>`. Drains the queue, sending batches of up to `maxBatch` events. Concurrent calls share one in-flight drain. Never rejects — network failures are retried and eventually dropped internally (see below).
 - `ct.shutdown()` — `Promise<void>`. Stops the background timer, then flushes.
 
@@ -77,6 +79,7 @@ Only `flush()` and `shutdown()` return promises. Everything else (`startSession`
 - **Retry**: network errors, `408`, `429`, and `5xx` responses are retried with exponential backoff (200ms, 400ms — 3 attempts total), then dropped and reported via `onError`. Other `4xx` responses (e.g. `400`, `401`, `404`) are treated as permanent — they're reported via `onError` and the batch is dropped immediately, without burning retries on a request that can't succeed. A dropped batch is never retried again on a later `flush()`.
 - **Partial rejection**: a `200` response can still partially reject a batch (`{ accepted, rejected: [{ index, reason }] }` — e.g. one malformed event mixed in with good ones). Those drops are never silent: the SDK reports one summarized `Error` via `onError` listing each rejected event's type and reason. A non-JSON or unparsable response body is tolerated (no `onError` call, since there's nothing meaningful to report).
 - **Backpressure**: the queue is bounded by `maxQueue`. On overflow the oldest queued event is dropped (not the newest) and `onError` fires, so recent activity is preserved over stale activity.
+- **Outcome correlation**: `segment.outcome(o)` / `session.outcome(segmentId, o)` both just enqueue a `segment.outcome` event — same batching, retry, and drop semantics as any other event. The server does the actual correlation (matching `segmentId` against a previously ingested `segment.recorded`) and rejects the event with `'unknown segment'` if it can't find one; that per-event rejection surfaces through the normal partial-rejection `onError` path above, not as a special case.
 - **Option validation**: `maxBatch` and `maxQueue` are floored to whole numbers and must be `>= 1`; `flushIntervalMs` must be `>= 0`. A `NaN`, non-finite, or out-of-range value (including `maxBatch: 0`, which would otherwise make `flush()` loop forever splicing zero-length batches) is ignored and the default is used instead.
 - **Never throws**: capture calls never throw, and `flush()`/`shutdown()` never reject. All failures surface only via `onError`.
 - **Browser lifecycle flush**: in browsers, hiding or unloading the page triggers an immediate keepalive flush of everything queued (see "Using from a browser"). In Node this path is inert.
@@ -140,6 +143,10 @@ import { createClient, type SegmentBuilder, type SessionHandle } from '@context-
 
 const ct = createClient({ endpoint: 'http://localhost:4720', onError: console.warn });
 
+// handleLLMStart -> handleLLMEnd is exactly the shape `seg.outcome(o)` is for:
+// the same handler instance holds the SegmentBuilder from start to end, so
+// measuring latency is just a start-time map keyed by runId (see below).
+
 /**
  * Generic async callback-handler adapter, shaped like a LangChain
  * BaseCallbackHandler. Swap the method names/signatures for whatever your
@@ -150,6 +157,7 @@ const ct = createClient({ endpoint: 'http://localhost:4720', onError: console.wa
 class ContextTraceCallbackHandler {
   private sessions = new Map<string, SessionHandle>();
   private segments = new Map<string, SegmentBuilder>();
+  private startedAt = new Map<string, number>();
 
   // Called once per top-level chain/agent run.
   async handleChainStart(run: { runId: string; name: string }): Promise<void> {
@@ -186,6 +194,7 @@ class ContextTraceCallbackHandler {
     }
 
     this.segments.set(run.runId, segment);
+    this.startedAt.set(run.runId, Date.now());
   }
 
   // Called when the model call finishes. May race with other in-flight
@@ -203,7 +212,29 @@ class ContextTraceCallbackHandler {
       content: run.output,
     });
     segment.record(); // idempotent — safe even if a retry calls this twice
+
+    // outcome() is only valid after record() (see API above), so it always
+    // comes second — measured latency plus the response text right there.
+    const startedAt = this.startedAt.get(run.runId);
+    segment.outcome({
+      responseText: run.output,
+      latencyMs: startedAt !== undefined ? Date.now() - startedAt : undefined,
+    });
+
     this.segments.delete(run.runId);
+    this.startedAt.delete(run.runId);
+  }
+
+  // Called when the model call errors out instead of completing normally.
+  async handleLLMError(run: { runId: string; error: Error }): Promise<void> {
+    const segment = this.segments.get(run.runId);
+    if (!segment) return;
+
+    segment.record(); // still record whatever context was assembled
+    segment.outcome({ error: run.error.message });
+
+    this.segments.delete(run.runId);
+    this.startedAt.delete(run.runId);
   }
 
   async handleChainEnd(run: { runId: string }): Promise<void> {

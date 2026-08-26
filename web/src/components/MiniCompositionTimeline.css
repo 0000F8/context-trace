@@ -1,0 +1,14 @@
+.mini-timeline {
+  overflow-x: auto;
+}
+
+.mini-timeline__label {
+  font-size: var(--text-dense);
+  color: var(--ink-2);
+  margin: 0 0 4px;
+}
+
+.mini-timeline__baseline {
+  stroke: var(--line);
+  stroke-width: 1;
+}

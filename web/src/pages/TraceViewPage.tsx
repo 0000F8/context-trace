@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import type { SegmentDetail } from '@context-trace/types';
-import { getSegmentDetail, getTrace } from '../lib/api';
+import type { Finding, SegmentDetail } from '@context-trace/types';
+import { getAnalytics, getSegmentDetail, getTrace, liveUrl } from '../lib/api';
 import { useFetch } from '../lib/useFetch';
 import { assignServiceColors, deriveServiceOrder } from '../lib/colors';
 import { buildCellStates, findPreviousSegment, groupSpansByService } from '../lib/strata';
+import { buildDeepLinkSearch, parseDeepLink } from '../lib/deep-link';
 import { COLUMN_WIDTH, ROW_LABEL_WIDTH } from '../lib/layout';
 import { LeftRail } from '../components/LeftRail';
 import { CompositionTimeline } from '../components/CompositionTimeline';
@@ -16,10 +17,17 @@ import { ErrorState } from '../components/ErrorState';
 import { EmptyState } from '../components/EmptyState';
 import './TraceViewPage.css';
 
+const SCRUBBER_INTERVAL_MS = 700;
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+}
+
 export function TraceViewPage() {
   const { id } = useParams<{ id: string }>();
   const sessionId = id ?? '';
   const traceState = useFetch(() => getTrace(sessionId), [sessionId]);
+  const analyticsState = useFetch(() => getAnalytics(sessionId), [sessionId]);
 
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [hoveredService, setHoveredService] = useState<string | null>(null);
@@ -31,6 +39,10 @@ export function TraceViewPage() {
   const [gutterMinimized, setGutterMinimized] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isLive, setIsLive] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const deepLinkAppliedRef = useRef<string | null>(null);
   // Manual gutter width (drag handle); null = auto-fit to the longest key.
   const [gutterPref, setGutterPref] = useState<number | null>(() => {
     const v = Number(localStorage.getItem('ct:gutterWidth'));
@@ -38,23 +50,51 @@ export function TraceViewPage() {
   });
 
   const trace = traceState.status === 'ready' ? traceState.data : null;
+  const analytics = analyticsState.status === 'ready' ? analyticsState.data : null;
 
-  // Select the latest segment whenever a new trace loads.
+  // Select the latest segment (or the segment named by a deep link) whenever a
+  // new trace loads for a session we haven't applied a deep link to yet.
   useEffect(() => {
     if (!trace || trace.segments.length === 0) {
       setSelectedIndex(null);
       return;
     }
     const last = trace.segments[trace.segments.length - 1]!;
+    if (deepLinkAppliedRef.current !== trace.session.id) {
+      deepLinkAppliedRef.current = trace.session.id;
+      const deepLink = parseDeepLink(window.location.search);
+      const wanted =
+        deepLink.segment != null && trace.segments.some((s) => s.index === deepLink.segment) ? deepLink.segment : last.index;
+      setSelectedIndex(wanted);
+      setSegmentDetails(new Map());
+      if (deepLink.section && trace.spans.some((s) => s.key === deepLink.section)) {
+        setDrawerKey(deepLink.section);
+      }
+      return;
+    }
     setSelectedIndex(last.index);
     setSegmentDetails(new Map());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trace?.session.id]);
 
+  // Keep the URL in sync with the current selection/drawer (no navigation).
+  useEffect(() => {
+    if (!trace) return;
+    const qs = buildDeepLinkSearch(window.location.search, { segment: selectedIndex, section: drawerKey });
+    window.history.replaceState(null, '', `${window.location.pathname}${qs}`);
+  }, [trace, selectedIndex, drawerKey]);
+
   const serviceOrder = useMemo(() => (trace ? deriveServiceOrder(trace) : []), [trace]);
   const colorMap = useMemo(() => assignServiceColors(serviceOrder), [serviceOrder]);
   const cellStates = useMemo(() => (trace ? buildCellStates(trace) : new Map()), [trace]);
   const groups = useMemo(() => (trace ? groupSpansByService(trace.spans, serviceOrder) : []), [trace, serviceOrder]);
+
+  const rawWindow = trace?.session.metadata?.window;
+  const budgetWindow = typeof rawWindow === 'number' ? rawWindow : undefined;
+  const overWindowIndexes = useMemo(
+    () => new Set((analytics?.perSegment ?? []).filter((p) => p.overWindow).map((p) => p.index)),
+    [analytics],
+  );
 
   // Auto-fit the label gutter to the longest section key (IBM Plex Mono at
   // 12px advances ~7.2px/char), clamped so huge keys can't eat the chart.
@@ -70,6 +110,81 @@ export function TraceViewPage() {
     if (w == null) localStorage.removeItem('ct:gutterWidth');
     else localStorage.setItem('ct:gutterWidth', String(w));
   };
+
+  // Any deliberate click pauses the scrubber — only its own timer advances
+  // the selection while playing.
+  const handleManualSelect = (index: number) => {
+    setIsPlaying(false);
+    setSelectedIndex(index);
+  };
+
+  const handleSelectFinding = (finding: Finding) => {
+    if (finding.segmentIndex != null) handleManualSelect(finding.segmentIndex);
+    if (finding.key) setDrawerKey(finding.key);
+  };
+
+  const togglePlay = () => setIsPlaying((v) => !v);
+
+  const toggleLive = () => {
+    setLiveError(null);
+    setIsLive((v) => !v);
+  };
+
+  // Scrubber: steps the selection forward every 700ms, pausing at the last
+  // segment. Manual selection (handleManualSelect) stops it.
+  useEffect(() => {
+    if (!isPlaying || !trace || trace.segments.length === 0) return;
+    const sorted = [...trace.segments].sort((a, b) => a.index - b.index);
+    const timer = window.setInterval(() => {
+      setSelectedIndex((current) => {
+        const pos = current == null ? -1 : sorted.findIndex((s) => s.index === current);
+        const nextPos = pos + 1;
+        if (nextPos >= sorted.length) {
+          setIsPlaying(false);
+          return current;
+        }
+        return sorted[nextPos]!.index;
+      });
+    }, SCRUBBER_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, trace]);
+
+  // Live tail: subscribe to the session's SSE stream while toggled on;
+  // segment/outcome events just trigger a cheap refetch of both trace and
+  // analytics. Auto-select + scroll effect (below) reacts to the refreshed
+  // trace rather than the raw SSE events.
+  useEffect(() => {
+    if (!isLive || !sessionId) return;
+    const source = new EventSource(liveUrl(sessionId));
+    const onUpdate = () => {
+      traceState.reload();
+      analyticsState.reload();
+    };
+    source.addEventListener('segment', onUpdate);
+    source.addEventListener('outcome', onUpdate);
+    source.onerror = () => {
+      source.close();
+      setIsLive(false);
+      setLiveError('Live connection lost.');
+    };
+    return () => {
+      source.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLive, sessionId]);
+
+  // When live and the trace refreshes (new segment/outcome arrived), jump to
+  // and reveal the newest segment.
+  useEffect(() => {
+    if (!isLive || !trace || trace.segments.length === 0) return;
+    const last = trace.segments[trace.segments.length - 1]!;
+    setSelectedIndex(last.index);
+    const behavior: ScrollBehavior = prefersReducedMotion() ? 'auto' : 'smooth';
+    requestAnimationFrame(() => {
+      document.querySelector(`[data-segment-index="${last.index}"]`)?.scrollIntoView({ behavior, inline: 'end', block: 'nearest' });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trace, isLive]);
 
   useEffect(() => {
     if (!trace || selectedIndex == null) return;
@@ -135,7 +250,7 @@ export function TraceViewPage() {
 
   const selectedSegment = trace.segments.find((s) => s.index === selectedIndex) ?? null;
   const selectedDetail = selectedIndex != null ? (segmentDetails.get(selectedIndex) ?? null) : null;
-  const maxTokens = Math.max(...trace.segments.map((s) => s.totalTokens), 1);
+  const maxTokens = Math.max(...trace.segments.map((s) => s.totalTokens), budgetWindow ?? 0, 1);
   const selectedColumn = selectedIndex != null ? trace.segments.findIndex((s) => s.index === selectedIndex) : -1;
 
   const drawerSpan = drawerKey ? (trace.spans.find((s) => s.key === drawerKey) ?? null) : null;
@@ -174,20 +289,32 @@ export function TraceViewPage() {
             colorMap={colorMap}
             hoveredService={hoveredService}
             onHoverService={setHoveredService}
+            analytics={analytics}
+            onSelectFinding={handleSelectFinding}
           />
         </div>
       )}
       <div className="trace-view__center">
         <div className="trace-view__zone-head">
           <p className="trace-view__zone-title">Composition timeline</p>
-          <button
-            type="button"
-            className="gutter-toggle"
-            onClick={() => setGutterMinimized((v) => !v)}
-            aria-pressed={gutterMinimized}
-          >
-            {gutterMinimized ? 'Show labels' : 'Hide labels'}
-          </button>
+          <div className="trace-view__zone-actions">
+            <button type="button" className="scrubber-toggle" onClick={togglePlay} aria-pressed={isPlaying}>
+              {isPlaying ? 'Pause' : 'Play'}
+            </button>
+            <button type="button" className={`live-toggle${isLive ? ' is-active' : ''}`} onClick={toggleLive} aria-pressed={isLive}>
+              <span className={`live-toggle__dot${isLive ? ' is-pulsing' : ''}`} aria-hidden />
+              Live
+            </button>
+            {liveError && <span className="live-toggle__error">{liveError}</span>}
+            <button
+              type="button"
+              className="gutter-toggle"
+              onClick={() => setGutterMinimized((v) => !v)}
+              aria-pressed={gutterMinimized}
+            >
+              {gutterMinimized ? 'Show labels' : 'Hide labels'}
+            </button>
+          </div>
         </div>
         <div className="trace-view__scroll">
           {selectedColumn >= 0 && (
@@ -203,7 +330,9 @@ export function TraceViewPage() {
             selectedIndex={selectedIndex}
             hoveredService={hoveredService}
             gutterWidth={gutterWidth}
-            onSelect={setSelectedIndex}
+            budgetWindow={budgetWindow}
+            overWindowIndexes={overWindowIndexes}
+            onSelect={handleManualSelect}
           />
           <p className="trace-view__zone-title">Strata grid (section lanes)</p>
           <StrataGrid
@@ -214,7 +343,7 @@ export function TraceViewPage() {
             hoveredService={hoveredService}
             gutterWidth={gutterWidth}
             onResizeGutter={resizeGutter}
-            onSelectSegment={setSelectedIndex}
+            onSelectSegment={handleManualSelect}
             onSelectSection={setDrawerKey}
           />
         </div>

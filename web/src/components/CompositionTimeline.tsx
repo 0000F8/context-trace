@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { TraceSegment } from '@context-trace/types';
 import { COLUMN_WIDTH, TIMELINE_HEIGHT } from '../lib/layout';
-import { formatTokens } from '../lib/format';
+import { formatCompactTokens, formatTokens } from '../lib/format';
 import type { CSSVarStyle } from '../lib/css-vars';
 import './CompositionTimeline.css';
 
@@ -13,6 +13,10 @@ interface CompositionTimelineProps {
   hoveredService: string | null;
   /** Width of the sticky left gutter; below 60px the tick labels are hidden. */
   gutterWidth: number;
+  /** Context window from session.metadata.window, when numeric — draws the budget hairline. */
+  budgetWindow?: number;
+  /** Segment indexes whose total exceeds the budget window — tints the index label. */
+  overWindowIndexes?: Set<number>;
   onSelect: (index: number) => void;
 }
 
@@ -33,12 +37,24 @@ function niceTicks(max: number, target = 4): number[] {
   return ticks;
 }
 
-export function CompositionTimeline({ segments, colorMap, maxTokens, selectedIndex, hoveredService, gutterWidth, onSelect }: CompositionTimelineProps) {
+export function CompositionTimeline({
+  segments,
+  colorMap,
+  maxTokens,
+  selectedIndex,
+  hoveredService,
+  gutterWidth,
+  budgetWindow,
+  overWindowIndexes,
+  onSelect,
+}: CompositionTimelineProps) {
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
   const width = gutterWidth + segments.length * COLUMN_WIDTH;
   const showTickLabels = gutterWidth >= 60;
   const barAreaHeight = TIMELINE_HEIGHT - 20;
   const serviceOrderList = [...colorMap.keys()];
+  const budgetY =
+    budgetWindow != null && maxTokens > 0 ? barAreaHeight - (budgetWindow / maxTokens) * barAreaHeight : null;
 
   const points = segments.map((seg, i) => {
     const x = gutterWidth + i * COLUMN_WIDTH + COLUMN_WIDTH / 2;
@@ -70,6 +86,11 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
               {formatTokens(v)}
             </span>
           ))}
+        {showTickLabels && budgetY != null && (
+          <span className="timeline__axis-sticky-label timeline__axis-sticky-label--budget" style={{ top: 4 + budgetY - 7 }}>
+            window {formatCompactTokens(budgetWindow!)}
+          </span>
+        )}
       </div>
       <svg width={width} height={TIMELINE_HEIGHT} role="img" aria-label="Composition timeline">
         {ticks.map((v) => {
@@ -77,6 +98,7 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
           return <line key={v} x1={0} y1={y} x2={width} y2={y} className="timeline__gridline" />;
         })}
         <line x1={0} y1={barAreaHeight} x2={width} y2={barAreaHeight} className="timeline__baseline" />
+        {budgetY != null && <line x1={0} y1={budgetY} x2={width} y2={budgetY} className="timeline__budget-line" />}
         {segments.map((seg, i) => {
           const x = gutterWidth + i * COLUMN_WIDTH;
           let cursorY = barAreaHeight;
@@ -105,6 +127,7 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
             <g
               key={seg.id}
               className="timeline__column"
+              data-segment-index={seg.index}
               style={{ '--i': i } as CSSVarStyle}
               tabIndex={0}
               role="button"
@@ -130,6 +153,17 @@ export function CompositionTimeline({ segments, colorMap, maxTokens, selectedInd
         <path d={linePath} className="timeline__trend" fill="none" />
         {points.map((p, i) => (
           <circle key={i} cx={p.x} cy={p.y} r={2} className="timeline__trend-dot" />
+        ))}
+        {segments.map((seg, i) => (
+          <text
+            key={`idx-${seg.id}`}
+            x={gutterWidth + i * COLUMN_WIDTH + COLUMN_WIDTH / 2}
+            y={barAreaHeight + 14}
+            textAnchor="middle"
+            className={`timeline__index-label${overWindowIndexes?.has(seg.index) ? ' is-over-window' : ''}`}
+          >
+            {seg.index}
+          </text>
         ))}
       </svg>
       {tooltip && (

@@ -17,10 +17,14 @@
 
 .sessions-page__toolbar {
   margin: 20px 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .sessions-page__search {
-  width: 100%;
+  flex: 1 1 320px;
   max-width: 320px;
   padding: 7px 10px;
   border: 1px solid var(--line);
@@ -33,4 +37,34 @@
   outline: 2px solid var(--focus);
   outline-offset: 1px;
   border-color: var(--focus);
+}
+
+.sessions-page__mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-max);
+  overflow: hidden;
+}
+
+.sessions-page__mode-toggle button {
+  background: var(--surface);
+  border: none;
+  padding: 6px 12px;
+  font-size: var(--text-dense);
+  color: var(--ink-2);
+}
+
+.sessions-page__mode-toggle button + button {
+  border-left: 1px solid var(--line);
+}
+
+.sessions-page__mode-toggle button[aria-pressed='true'] {
+  background: var(--bg);
+  color: var(--ink);
+  font-weight: 450;
+}
+
+.sessions-page__hint {
+  color: var(--ink-2);
+  padding: 24px 0;
 }

@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { Hono } from 'hono';
 import { fnv1a64 } from '@context-trace/types';
-import { createApp } from './app.js';
-import { openDb, type Db } from './db.js';
+import { createApp, getBus } from './app.js';
+import { openDb, setFtsSupport, type Db } from './db.js';
 
 function baseUrl() {
   return 'http://localhost';
@@ -646,6 +646,407 @@ describe('app', () => {
         peakTokens: 42,
         services: ['huge-svc', 'memory-svc', 'retrieval-svc'],
       });
+    });
+  });
+
+  describe('segment.outcome', () => {
+    async function ingestSessionAndSegment(app: Hono, sessionId: string, segmentId: string) {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: sessionId, name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: segmentId, sessionId, index: 0, sections: [{ key: 'a', content: 'hi' }] }),
+          ],
+        }),
+      });
+    }
+
+    it('applies an outcome and exposes it on the session detail, segment detail, and trace', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+
+      const outcome = { responseText: 'all done', latencyMs: 1234, scores: { helpfulness: 0.9 } };
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome } }],
+        }),
+      });
+      expect((await res.json()).accepted).toBe(1);
+
+      const detail = await (await app.request(`${baseUrl()}/v1/sessions/s1`)).json();
+      expect(detail.segments[0].outcome).toEqual(outcome);
+
+      const segDetail = await (await app.request(`${baseUrl()}/v1/sessions/s1/segments/0`)).json();
+      expect(segDetail.segment.outcome).toEqual(outcome);
+
+      const trace = await (await app.request(`${baseUrl()}/v1/sessions/s1/trace`)).json();
+      expect(trace.segments[0].outcome).toEqual(outcome);
+    });
+
+    it('rejects an outcome for an unknown segment with a per-event reason', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'ghost-seg', outcome: {} } }],
+        }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(0);
+      expect(body.rejected).toEqual([{ index: 0, reason: 'unknown segment' }]);
+    });
+
+    it('rejects an outcome whose segmentId belongs to a different session', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+      await ingestSessionAndSegment(app, 's2', 'seg-1');
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'segment.outcome', data: { sessionId: 's2', segmentId: 'seg-0', outcome: {} } }],
+        }),
+      });
+      expect((await res.json()).rejected).toEqual([{ index: 0, reason: 'unknown segment' }]);
+    });
+
+    it('rejects responseText/error/scores over their caps with named reasons', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+      const events = [
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { responseText: 'x'.repeat(262_145) } } },
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { error: 'x'.repeat(4_097) } } },
+        {
+          type: 'segment.outcome',
+          data: {
+            sessionId: 's1',
+            segmentId: 'seg-0',
+            outcome: { scores: Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`k${i}`, 1])) },
+          },
+        },
+        { type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { responseText: 'x'.repeat(262_144) } } }, // at limit: accepted
+      ];
+      const res = await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ events }),
+      });
+      const body = await res.json();
+      expect(body.accepted).toBe(1);
+      expect(body.rejected).toEqual([
+        { index: 0, reason: 'outcome.responseText exceeds max length of 262144' },
+        { index: 1, reason: 'outcome.error exceeds max length of 4096' },
+        { index: 2, reason: 'outcome.scores exceeds max of 32 score keys' },
+      ]);
+    });
+
+    it('does not wipe a previously-applied outcome when the segment is re-recorded (idempotent re-ingest)', async () => {
+      await ingestSessionAndSegment(app, 's1', 'seg-0');
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { latencyMs: 500 } } }],
+        }),
+      });
+      // Re-record the same segment id (e.g. a client retry) — outcome must survive.
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 0, sections: [{ key: 'a', content: 'updated' }] })],
+        }),
+      });
+      const segDetail = await (await app.request(`${baseUrl()}/v1/sessions/s1/segments/0`)).json();
+      expect(segDetail.segment.outcome).toEqual({ latencyMs: 500 });
+    });
+  });
+
+  describe('GET /v1/sessions/:id/trace/analytics', () => {
+    it('returns computed analytics for a known session and 404 for an unknown one', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', metadata: { window: 10 }, startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 0, sections: [{ key: 'a', content: 'x'.repeat(20) }] }),
+          ],
+        }),
+      });
+      const res = await app.request(`${baseUrl()}/v1/sessions/s1/trace/analytics`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.window).toBe(10);
+      expect(body.perSegment[0].overWindow).toBe(true);
+      expect(body.findings.some((f: { kind: string }) => f.kind === 'over-window')).toBe(true);
+
+      expect((await app.request(`${baseUrl()}/v1/sessions/nope/trace/analytics`)).status).toBe(404);
+    });
+  });
+
+  describe('GET /v1/sessions/:id/live (SSE)', () => {
+    async function readNextEvent(reader: ReadableStreamDefaultReader<Uint8Array>, decoder: TextDecoder, state: { buffer: string }) {
+      while (!state.buffer.includes('\n\n')) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        state.buffer += decoder.decode(value, { stream: true });
+      }
+      const idx = state.buffer.indexOf('\n\n');
+      const chunk = state.buffer.slice(0, idx);
+      state.buffer = state.buffer.slice(idx + 2);
+      return chunk;
+    }
+
+    it('streams a segment event to a live listener and cleans up on stream close', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+
+      const bus = getBus(app)!;
+      expect(bus.listenerCount('s1')).toBe(0);
+
+      const res = await app.request(`${baseUrl()}/v1/sessions/s1/live`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('text/event-stream');
+      expect(bus.listenerCount('s1')).toBe(1);
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      const state = { buffer: '' };
+
+      // Trigger a segment.recorded event on the same session; it must arrive over the stream.
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 0, sections: [{ key: 'a', content: 'hi' }] })],
+        }),
+      });
+
+      const eventChunk = await readNextEvent(reader, decoder, state);
+      expect(eventChunk).toContain('event: segment');
+      expect(eventChunk).toMatch(/"id":"seg-0"/);
+
+      await reader.cancel();
+      expect(bus.listenerCount('s1')).toBe(0);
+    });
+
+    it('streams an outcome event with segmentId, index, and the outcome payload', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: 'seg-0', sessionId: 's1', index: 0, sections: [{ key: 'a', content: 'hi' }] }),
+          ],
+        }),
+      });
+
+      const res = await app.request(`${baseUrl()}/v1/sessions/s1/live`);
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      const state = { buffer: '' };
+
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'segment.outcome', data: { sessionId: 's1', segmentId: 'seg-0', outcome: { latencyMs: 42 } } }],
+        }),
+      });
+
+      const eventChunk = await readNextEvent(reader, decoder, state);
+      expect(eventChunk).toContain('event: outcome');
+      const dataLine = eventChunk.split('\n').find((l) => l.startsWith('data: '))!;
+      const payload = JSON.parse(dataLine.slice('data: '.length));
+      expect(payload).toEqual({ segmentId: 'seg-0', index: 0, outcome: { latencyMs: 42 } });
+
+      await reader.cancel();
+    });
+
+    it('does not leak listeners across multiple connect/disconnect cycles', async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [{ type: 'session.started', data: { id: 's1', name: 'sess', startedAt: new Date(2026, 0, 1).toISOString() } }],
+        }),
+      });
+      const bus = getBus(app)!;
+
+      for (let i = 0; i < 3; i++) {
+        const res = await app.request(`${baseUrl()}/v1/sessions/s1/live`);
+        expect(bus.listenerCount('s1')).toBe(1);
+        await res.body!.getReader().cancel();
+        expect(bus.listenerCount('s1')).toBe(0);
+      }
+    });
+  });
+
+  describe('GET /v1/search', () => {
+    beforeEach(async () => {
+      await app.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: 's1', name: 'searchable session', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({
+              id: 'seg-0',
+              sessionId: 's1',
+              index: 0,
+              sections: [{ key: 'notes', content: 'the quick brown fox jumps over the lazy dog' }],
+            }),
+          ],
+        }),
+      });
+    });
+
+    it('returns a hit with sessionId/segmentIndex/key/service/snippet for a matching query', async () => {
+      const res = await app.request(`${baseUrl()}/v1/search?q=brown+fox`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.hits).toHaveLength(1);
+      expect(body.hits[0]).toMatchObject({
+        sessionId: 's1',
+        sessionName: 'searchable session',
+        segmentIndex: 0,
+        key: 'notes',
+        service: 'svc',
+      });
+      expect(body.hits[0].snippet).toContain('[');
+    });
+
+    it('treats FTS syntax characters in the query as a literal phrase instead of erroring', async () => {
+      const res = await app.request(`${baseUrl()}/v1/search?${new URLSearchParams({ q: '" OR "' })}`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.hits).toEqual([]);
+    });
+
+    it('returns 400 for a blank or missing q', async () => {
+      expect((await app.request(`${baseUrl()}/v1/search`)).status).toBe(400);
+      expect((await app.request(`${baseUrl()}/v1/search?q=`)).status).toBe(400);
+      expect((await app.request(`${baseUrl()}/v1/search?q=%20%20`)).status).toBe(400);
+    });
+
+    it('clamps limit into [1, 50]', async () => {
+      const res = await app.request(`${baseUrl()}/v1/search?q=fox&limit=999`);
+      expect(res.status).toBe(200); // doesn't error; clamped server-side
+    });
+
+    it('returns 501 when the database lacks FTS5 support', async () => {
+      const noFtsDb = openDb(':memory:');
+      setFtsSupport(noFtsDb, false);
+      const noFtsApp = createApp(noFtsDb);
+      const res = await noFtsApp.request(`${baseUrl()}/v1/search?q=anything`);
+      expect(res.status).toBe(501);
+      expect(await res.json()).toEqual({ error: 'search unavailable' });
+    });
+  });
+
+  describe('export / import', () => {
+    async function seedExportableSession(target: Hono, sessionId: string) {
+      await target.request(`${baseUrl()}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: [
+            { type: 'session.started', data: { id: sessionId, name: 'exportable', startedAt: new Date(2026, 0, 1).toISOString() } },
+            makeSegmentEvent({ id: `${sessionId}-seg-0`, sessionId, index: 0, sections: [{ key: 'a', content: 'first' }] }),
+            makeSegmentEvent({
+              id: `${sessionId}-seg-1`,
+              sessionId,
+              index: 1,
+              sections: [
+                { key: 'a', content: 'first' },
+                { key: 'b', content: 'second' },
+              ],
+            }),
+            {
+              type: 'segment.outcome',
+              data: { sessionId, segmentId: `${sessionId}-seg-1`, outcome: { latencyMs: 111, scores: { helpfulness: 0.5 } } },
+            },
+          ],
+        }),
+      });
+    }
+
+    it('exports a session with a content-disposition header and version 1 envelope', async () => {
+      await seedExportableSession(app, 's1');
+      const res = await app.request(`${baseUrl()}/v1/sessions/s1/export`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-disposition')).toBe('attachment; filename="s1.context-trace.json"');
+      const body = await res.json();
+      expect(body.version).toBe(1);
+      expect(body.session.id).toBe('s1');
+      expect(body.segments).toHaveLength(2);
+      expect(body.segments[1].outcome).toEqual({ latencyMs: 111, scores: { helpfulness: 0.5 } });
+    });
+
+    it('returns 404 exporting an unknown session', async () => {
+      expect((await app.request(`${baseUrl()}/v1/sessions/nope/export`)).status).toBe(404);
+    });
+
+    it('round-trips export -> delete -> import: the trace and outcomes match before and after', async () => {
+      await seedExportableSession(app, 's1');
+      const traceBefore = await (await app.request(`${baseUrl()}/v1/sessions/s1/trace`)).json();
+      const exported = await (await app.request(`${baseUrl()}/v1/sessions/s1/export`)).json();
+
+      const delRes = await app.request(`${baseUrl()}/v1/sessions/s1`, { method: 'DELETE' });
+      expect(delRes.status).toBe(200);
+      expect((await app.request(`${baseUrl()}/v1/sessions/s1`)).status).toBe(404);
+
+      const importRes = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(exported),
+      });
+      expect(importRes.status).toBe(200);
+      expect(await importRes.json()).toEqual({ accepted: { segments: 2 } });
+
+      const traceAfter = await (await app.request(`${baseUrl()}/v1/sessions/s1/trace`)).json();
+      expect(traceAfter).toEqual(traceBefore);
+
+      const detail = await (await app.request(`${baseUrl()}/v1/sessions/s1`)).json();
+      expect(detail.segments[1].outcome).toEqual({ latencyMs: 111, scores: { helpfulness: 0.5 } });
+    });
+
+    it('rejects import with an unsupported version', async () => {
+      const res = await app.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ version: 2, session: { id: 's1', name: 'x', startedAt: new Date(2026, 0, 1).toISOString() }, segments: [] }),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('requires x-api-key on /v1/import when a key is configured', async () => {
+      await seedExportableSession(app, 's1');
+      const exported = await (await app.request(`${baseUrl()}/v1/sessions/s1/export`)).json();
+
+      const keyedApp = createApp(openDb(':memory:'), { apiKey: 'secret' });
+      const missing = await keyedApp.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(exported),
+      });
+      expect(missing.status).toBe(401);
+
+      const right = await keyedApp.request(`${baseUrl()}/v1/import`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'secret' },
+        body: JSON.stringify(exported),
+      });
+      expect(right.status).toBe(200);
     });
   });
 });

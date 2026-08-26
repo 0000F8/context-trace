@@ -3,9 +3,45 @@
  * Safe to re-run: sessions/segments use fixed ids and are upserted.
  */
 import { estimateTokens, fnv1a64 } from '@context-trace/types';
-import type { Section, SectionRole, ServiceKind, SegmentKind, SegmentWithSections, Session } from '@context-trace/types';
+import type {
+  Section,
+  SectionRole,
+  SegmentOutcome,
+  ServiceKind,
+  SegmentKind,
+  SegmentWithSections,
+  Session,
+} from '@context-trace/types';
 import { openDb } from './db.js';
-import { endSession, getStats, upsertSegment, upsertSession } from './store.js';
+import { applySegmentOutcome, endSession, getStats, upsertSegment, upsertSession } from './store.js';
+
+/**
+ * Deterministic pseudo-random fraction in [0, 1) derived from a seed string — used so
+ * seeded outcomes vary per segment without relying on Math.random(), keeping re-runs
+ * of the seed script byte-for-byte reproducible (required for idempotency).
+ */
+function pseudoFraction(seed: string): number {
+  const hash = fnv1a64(seed);
+  const n = Number.parseInt(hash.slice(-8), 16);
+  return (n % 10_000) / 9_999;
+}
+
+/**
+ * Builds a demo `SegmentOutcome`: latency rises with conversation progress (800-2600ms),
+ * helpfulness score trends toward the high end (0.62-0.95), both with a little
+ * per-segment jitter so the curve doesn't look perfectly linear.
+ */
+function buildOutcome(segmentId: string, index: number, total: number): SegmentOutcome {
+  const progress = total > 1 ? index / (total - 1) : 0;
+  const jitter = pseudoFraction(segmentId);
+  const latencyMs = Math.round(800 + (2600 - 800) * (0.6 * progress + 0.4 * jitter));
+  const helpfulness = Number((0.62 + (0.95 - 0.62) * (0.7 * progress + 0.3 * jitter)).toFixed(2));
+  return {
+    latencyMs,
+    scores: { helpfulness },
+    responseText: `Response for segment ${index + 1} of ${total}.`,
+  };
+}
 
 interface SectionPlan {
   key: string;
@@ -52,7 +88,7 @@ const SUPPORT_CHAT: SessionPlan = {
   id: 'seed-support-chat',
   name: 'support-chat: order #48213 refund',
   agent: 'triage-bot',
-  metadata: { channel: 'web-widget', customerId: 'cus_48213' },
+  metadata: { channel: 'web-widget', customerId: 'cus_48213', window: 8192 },
   ended: true,
   segments: [
     {
@@ -611,6 +647,7 @@ function seedSession(db: ReturnType<typeof openDb>, plan: SessionPlan, baseTs: n
       sections,
     };
     upsertSegment(db, segment);
+    applySegmentOutcome(db, plan.id, segment.id, buildOutcome(segment.id, index, plan.segments.length));
   });
 
   if (plan.ended) {

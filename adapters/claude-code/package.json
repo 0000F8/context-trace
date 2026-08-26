@@ -1,0 +1,13 @@
+{
+  "name": "context-trace-claude-code-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code hook adapter: snapshots the transcript into context-trace on Stop/PostToolUse. Plain Node ESM, no build step, no runtime dependencies.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0"
+  }
+}

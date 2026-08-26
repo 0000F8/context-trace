@@ -142,6 +142,93 @@
   border-color: var(--focus);
 }
 
+.trace-view__zone-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scrubber-toggle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--focus);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.scrubber-toggle:hover {
+  border-color: var(--focus);
+}
+
+.scrubber-toggle[aria-pressed='true'] {
+  color: var(--surface);
+  background: var(--focus);
+  border-color: var(--focus);
+}
+
+.live-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.live-toggle:hover {
+  border-color: var(--focus);
+}
+
+.live-toggle.is-active {
+  color: var(--service-4);
+  border-color: var(--service-4);
+}
+
+.live-toggle__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-2);
+  flex: none;
+}
+
+.live-toggle.is-active .live-toggle__dot {
+  background: var(--service-4);
+}
+
+.live-toggle__dot.is-pulsing {
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-toggle__dot.is-pulsing {
+    animation: none;
+  }
+}
+
+.live-toggle__error {
+  font-size: 11px;
+  color: var(--service-4);
+}
+
 /* Opaque plate behind sticky gutter labels so chart content never shows
    through while panning. Shared by the timeline and the strata grid. */
 .chart-gutter-backdrop {

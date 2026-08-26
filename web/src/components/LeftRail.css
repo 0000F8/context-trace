@@ -89,6 +89,100 @@
   color: var(--ink-2);
 }
 
+.left-rail__findings {
+  margin-top: 24px;
+}
+
+.left-rail__findings h3 {
+  font-size: var(--text-dense);
+  font-weight: 600;
+  color: var(--ink-2);
+  margin: 0 0 8px;
+}
+
+.left-rail__findings ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.left-rail__finding-empty {
+  margin: 0;
+  font-size: var(--text-dense);
+  color: var(--ink-2);
+}
+
+.left-rail__finding {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 4px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  text-align: left;
+  color: inherit;
+}
+
+.left-rail__finding:hover {
+  background: var(--bg);
+}
+
+.left-rail__finding-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex: none;
+}
+
+.left-rail__finding-dot--warning {
+  background: var(--service-4);
+}
+
+.left-rail__finding-dot--notice {
+  background: var(--service-6);
+}
+
+.left-rail__finding-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.left-rail__finding-message {
+  font-size: var(--text-dense);
+  line-height: 1.4;
+}
+
+.left-rail__finding-key {
+  font-size: 11px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.left-rail__export {
+  margin-top: 24px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.left-rail__export a {
+  font-size: var(--text-dense);
+  text-decoration: none;
+}
+
+.left-rail__export a:hover {
+  text-decoration: underline;
+}
+
 @media (max-width: 900px) {
   .left-rail {
     border-right: none;

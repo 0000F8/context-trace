@@ -10,6 +10,7 @@ import type {
   Section,
   SectionState,
   Segment,
+  SegmentOutcome,
   ServiceKind,
   SessionSummary,
   TraceOp,
@@ -23,6 +24,7 @@ import type {
 /** A segment plus the sections that make up its snapshot. */
 export interface TraceSourceSegment extends Segment {
   sections: Section[];
+  outcome?: SegmentOutcome;
 }
 
 export interface DiffResult {
@@ -151,6 +153,7 @@ export function compileTrace(session: SessionSummary, segments: TraceSourceSegme
       sectionCount: seg.sections.length,
       services,
       ops,
+      outcome: seg.outcome,
     });
 
     for (const s of seg.sections) {
